@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx drizzle-kit *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\marcl\\\\OneDrive\\\\Desktop\\\\University\\\\Masters\\\\TA\\\\ILF_Hackathon\\\\OpenRemit\" -Force)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\marcl\\\\OneDrive\\\\Desktop\\\\University\\\\Masters\\\\TA\\\\ILF_Hackathon\\\\OpenRemit\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "PowerShell(head -30)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\marcl\\\\OneDrive\\\\Desktop\\\\University\\\\Masters\\\\TA\\\\ILF_Hackathon\\\\OpenRemit\\\\frontend\\\\\" -Recurse -File | Select-Object FullName, @{Name=\"Size\\(bytes\\)\";Expression={$_.Length}} | Sort-Object FullName)",
+      "Bash(Get-Content \"c:\\\\Users\\\\marcl\\\\OneDrive\\\\Desktop\\\\University\\\\Masters\\\\TA\\\\ILF_Hackathon\\\\OpenRemit\\\\frontend\\\\src\\\\styles.css\")",
+      "Bash(Measure-Object -Line)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\marcl\\\\OneDrive\\\\Desktop\\\\University\\\\Masters\\\\TA\\\\ILF_Hackathon\\\\OpenRemit\" -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(Format-Table -HideTableHeaders)",
+      "Bash(npm run *)"
+    ]
+  }
+}
