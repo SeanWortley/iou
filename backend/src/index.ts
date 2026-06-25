@@ -12,7 +12,7 @@ import { remitRouter } from './routes/remit';
 import { callbackRouter } from './routes/callback';
 import { authRouter } from './routes/auth';
 import { usersRouter } from './routes/users';
-import { requestsRouter } from './routes/requests';
+// import { requestsRouter } from './routes/requests';
 import { newsRouter } from './routes/news';
 import { errorHandler } from './middleware/errorHandler';
 import { seedNews } from './lib/seedNews';
@@ -159,7 +159,7 @@ app.post('/api/bot-webhook', webhookCallback(bot, 'express'));
 
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
-app.use('/api/requests', requestsRouter);
+// app.use('/api/requests', requestsRouter);
 app.use('/api/news', newsRouter);
 app.use('/api/remit', remitRouter);
 app.use('/api/callback', callbackRouter);

@@ -11,6 +11,9 @@ export const requestsRouter = Router();
 
 const MAX_NOTE_LENGTH = 280;
 
+import * as schema from '../db/schema';
+console.log("SCHEMA KEYS:", Object.keys(schema)); // Add this
+
 // Errors thrown with a status are surfaced as-is by the errorHandler middleware
 function httpError(status: number, message: string): Error {
   const err = new Error(message);
