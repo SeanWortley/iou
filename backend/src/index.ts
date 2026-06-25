@@ -1,30 +1,37 @@
 import { config } from './config';
 import express from 'express';
+import cors from 'cors';
+import { remitRouter } from './routes/remit';
 import { callbackRouter } from './routes/callback';
+import { authRouter } from './routes/auth';
+import { usersRouter } from './routes/users';
+import { requestsRouter } from './routes/requests';
+import { newsRouter } from './routes/news';
 import { errorHandler } from './middleware/errorHandler';
+import { seedNews } from './lib/seedNews';
 
 const app = express();
 
-app.use(express.json());
+app.use(cors({ origin: config.frontendUrl, credentials: true }));
+// Default limit is 100 KB — too small for base64 avatar uploads (up to ~280 KB)
+app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'iou-bot' });
+  res.json({ ok: true, service: 'openremit-backend' });
 });
 
-// Open Payments GNAP callback — the user's wallet redirects their browser here
-// after they approve or deny the payment consent screen.
+app.use('/api/auth', authRouter);
+app.use('/api/users', usersRouter);
+app.use('/api/requests', requestsRouter);
+app.use('/api/news', newsRouter);
+app.use('/api/remit', remitRouter);
 app.use('/api/callback', callbackRouter);
-
-// Telegram webhook — every message, button tap, and group event arrives here.
-// TODO: replace this stub with a grammy Bot instance once bot handlers are built.
-app.post('/telegram/webhook', (req, res) => {
-  console.log('[webhook]', JSON.stringify(req.body));
-  res.sendStatus(200);
-});
 
 app.use(errorHandler);
 
+// Seed the demo News posts on first boot (idempotent — no-op if any exist).
+seedNews().catch((err) => console.error('[seed] News seed failed:', err));
+
 app.listen(config.port, () => {
-  console.log(`\n  IOU bot backend  →  http://localhost:${config.port}`);
-  console.log(`  Telegram webhook →  ${config.telegram.webhookUrl}/telegram/webhook\n`);
+  console.log(`\n  OpenRemit backend → http://localhost:${config.port}\n`);
 });
