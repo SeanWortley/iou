@@ -1,11 +1,14 @@
 import {
   authorizePayment,
   buildPayment,
+  checkUser,
   clarifyPayment,
   confirmPayment,
   finalizePayment,
+  joinGroup,
   processPlainText,
   processRegistration,
+  type ChatContext,
   type ClarificationField,
   type ParseResult,
   type PaymentObject,
@@ -16,19 +19,20 @@ import {
 // Conversation state machine
 //
 // Registration:   awaiting_contact → awaiting_wallet_address → awaiting_wallet_key
-//                 → awaiting_password_setup → idle
+//                 → awaiting_password_setup → idle   (always happens in a DM)
 //
-// Two ways to start a payment, both ending in the same tail:
+// Groups ("money groups"):
+//   • bot added → posts a welcome telling people to /join
+//   • /join     → registered users are enrolled in the roster; others get a
+//                 deep-link button that opens a DM and runs /start (carrying the
+//                 group id, so they're enrolled once setup finishes).
+//   • /iou … in a group is a TRIGGER: the bot resolves the sender, parses with
+//     group context, then bounces the whole confirm → password → approve tail
+//     into the sender's DM. On success it announces the payment back in the group.
 //
-//   A. Natural language
-//        DM:    any plain text          ─┐
-//        /iou <text>  (DM or group)     ─┤→ processPlainText
-//   B. Manual wizard (via /pay button)
-//        recipient type → recipient → amount → fixed send/receive → buildPayment
-//
-//   …both → ParseResult ──(clarification loop)──► awaiting_confirmation
-//        ──Confirm──► confirmPayment → awaiting_payment_password ──password──►
-//        authorizePayment → awaiting_approval ──"I've approved"──► finalizePayment → idle
+// Payment tail (DM): ParseResult ──(clarify loop)──► awaiting_confirmation
+//   ──Confirm──► confirmPayment → awaiting_payment_password ──password──►
+//   authorizePayment → awaiting_approval ──"I've approved"──► finalizePayment → idle
 // ─────────────────────────────────────────────────────────────────────────────
 
 type UserStep =
@@ -52,6 +56,7 @@ type UserState = {
   contact?: string;
   walletAddress?: string;
   walletKey?: string;
+  pendingGroupId?: string; // enrol in this group once registration finishes
   // manual payment builder
   recipientType?: RecipientType;
   manualRecipient?: string;
@@ -61,6 +66,7 @@ type UserState = {
   payment?: PaymentObject;
   clarifications?: ClarificationField[];
   transactionId?: string;
+  originGroupChatId?: number; // group this payment was triggered from (for the public "paid" post)
 };
 
 const userState = new Map<number, UserState>();
@@ -91,7 +97,43 @@ function clearPaymentSession(state: UserState): void {
   delete state.payment;
   delete state.clarifications;
   delete state.transactionId;
+  delete state.originGroupChatId;
 }
+
+// A display handle for a Telegram user: a real @mention if they have a username,
+// otherwise just their first name.
+function mention(from: any): string {
+  return from?.username ? `@${from.username}` : (from?.first_name ?? "there");
+}
+
+// Deep link that opens the bot's DM and fires `/start join_<groupId>`.
+function deepLink(groupId: string): string {
+  const botUsername = process.env.BOT_USERNAME ?? "";
+  return `https://t.me/${botUsername}?start=join_${groupId}`;
+}
+
+function setupButton(groupId: string, text = "▶ Set me up") {
+  return { inline_keyboard: [[{ text, url: deepLink(groupId) }]] };
+}
+
+function paymentContext(ctx: any): ChatContext {
+  return { chatId: ctx.chat?.id, chatType: ctx.chat?.type };
+}
+
+async function isRegistered(userId: number): Promise<boolean> {
+  try {
+    return (await checkUser({ telegramUserId: userId })).registered;
+  } catch (error) {
+    console.error("checkUser failed", error);
+    return false; // fail open to registration rather than blocking the user
+  }
+}
+
+// Generic "send a message" — either a reply in the current chat, or a DM to a
+// specific user. Lets the same render logic deliver to a group OR a private chat.
+type Send = (text: string, other?: any) => Promise<any>;
+const replySend = (ctx: any): Send => (t, o) => ctx.reply(t, o);
+const dmSend = (ctx: any, chatId: number): Send => (t, o) => ctx.api.sendMessage(chatId, t, o);
 
 function formatPayment(p: PaymentObject): string {
   const lines = [
@@ -131,26 +173,34 @@ const payTypeKeyboard = {
   ],
 };
 
-// Send the user's text to the NL parser and render whatever comes back.
-async function runPlainText(ctx: any, state: UserState, userId: number, text: string): Promise<void> {
+// Send the user's text to the NL parser and render whatever comes back via `send`.
+async function runPlainText(
+  ctx: any,
+  state: UserState,
+  userId: number,
+  text: string,
+  context: ChatContext,
+  send: Send
+): Promise<void> {
   let result: ParseResult;
   try {
-    result = await processPlainText({ telegramUserId: userId, text });
+    result = await processPlainText({ telegramUserId: userId, text, context });
   } catch (error) {
     console.error("processPlainText failed", error);
-    await ctx.reply("I couldn't reach the payment service. Please try again in a moment.");
+    await send("I couldn't reach the payment service. Please try again in a moment.");
     return;
   }
-  await renderParseResult(ctx, state, result);
+  await renderParseResult(state, send, result);
 }
 
 // Render whatever the backend returned: either ask the next clarifying question,
-// or show the finished payment object for Confirm / Cancel.
-async function renderParseResult(ctx: any, state: UserState, result: ParseResult): Promise<void> {
+// or show the finished payment object for Confirm / Cancel. Everything goes
+// through `send`, so this works whether we're in a DM or bouncing into one.
+async function renderParseResult(state: UserState, send: Send, result: ParseResult): Promise<void> {
   if (result.status === "error") {
     clearPaymentSession(state);
     state.step = "idle";
-    await ctx.reply(`I couldn't read that: ${result.reason}\n\nTry rephrasing your payment.`);
+    await send(`I couldn't read that: ${result.reason}\n\nTry rephrasing your payment.`);
     return;
   }
 
@@ -163,7 +213,7 @@ async function renderParseResult(ctx: any, state: UserState, result: ParseResult
     const reply_markup = next?.suggestions?.length
       ? { keyboard: next.suggestions.map((s) => [{ text: s }]), resize_keyboard: true, one_time_keyboard: true }
       : { force_reply: true };
-    await ctx.reply(next?.question ?? "Could you clarify that?", { reply_markup });
+    await send(next?.question ?? "Could you clarify that?", { reply_markup });
     return;
   }
 
@@ -171,7 +221,7 @@ async function renderParseResult(ctx: any, state: UserState, result: ParseResult
   state.payment = result.payment;
   state.clarifications = undefined;
   state.step = "awaiting_confirmation";
-  await ctx.reply(formatPayment(result.payment), { reply_markup: confirmKeyboard });
+  await send(formatPayment(result.payment), { reply_markup: confirmKeyboard });
 }
 
 // Manual builder: recipient captured (typed or shared) → ask for the amount.
@@ -181,6 +231,28 @@ async function captureManualRecipient(ctx: any, state: UserState, value: string)
   await ctx.reply("💸 How much? Enter the amount (numbers only, e.g. 50 or 50.00):", {
     reply_markup: { force_reply: true },
   });
+}
+
+// ── Bot added to / removed from a group ──────────────────────────────────────
+export async function handleChatMemberUpdate(ctx: any): Promise<void> {
+  const update = ctx.myChatMember;
+  if (!update) return;
+  const oldStatus = update.old_chat_member?.status;
+  const newStatus = update.new_chat_member?.status;
+  const chatType = ctx.chat?.type;
+
+  const joined =
+    (newStatus === "member" || newStatus === "administrator") &&
+    (oldStatus === "left" || oldStatus === "kicked" || !oldStatus);
+
+  if (joined && (chatType === "group" || chatType === "supergroup")) {
+    await ctx.reply(
+      "Hi, I'm the IOU Bot 👋\n\n" +
+        "I let this group send money to each other.\n" +
+        "• Type /join to join the money group — I'll set up your wallet in a private chat.\n" +
+        "• Then pay anyone here with:  /iou pay @alice 50"
+    );
+  }
 }
 
 export async function handleBotMessage(ctx: any): Promise<void> {
@@ -211,51 +283,122 @@ export async function handleBotMessage(ctx: any): Promise<void> {
   if (!msg.text) return;
   const text = msg.text.trim();
 
-  // Commands
+  // Commands. In groups commands arrive as "/iou@BotUsername" — strip the suffix.
   const entities = msg.entities ?? [];
   const commandEntity = entities.find((e: any) => e.type === "bot_command");
-  const command = commandEntity
+  const rawCommand = commandEntity
     ? text.slice(commandEntity.offset, commandEntity.offset + commandEntity.length)
+    : "";
+  const command = rawCommand.split("@")[0];
+  const afterCommand = commandEntity
+    ? text.slice(commandEntity.offset + commandEntity.length).trim()
     : "";
 
   if (command === "/start") {
-    userState.set(userId, { step: "awaiting_contact" });
-    await ctx.reply(
-      "Welcome to IOU!\n📱 Share your contact so we can register you.",
-      {
-        reply_markup: {
-          keyboard: [[{ text: "📱 Share My Number", request_contact: true }]],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
+    // Deep-link payload: "join_<groupId>" enrols the user in that group.
+    const groupId = afterCommand.startsWith("join_") ? afterCommand.slice("join_".length) : undefined;
+
+    if (await isRegistered(userId)) {
+      if (groupId) {
+        try {
+          await joinGroup({ telegramUserId: userId, telegramUsername: ctx.from?.username, groupTelegramId: groupId });
+          await ctx.reply("✅ You're set up and now part of that money group. Just tell me what to pay.");
+        } catch (error) {
+          console.error("joinGroup failed", error);
+          await ctx.reply("You're registered, but I couldn't add you to the group. Try /join again in the group.");
+        }
+      } else {
+        await ctx.reply("You're already set up! Send /pay, or just tell me what you'd like to pay.");
       }
-    );
+      return;
+    }
+
+    userState.set(userId, { step: "awaiting_contact", pendingGroupId: groupId });
+    await ctx.reply("Welcome to IOU!\n📱 Share your contact so we can register you.", {
+      reply_markup: {
+        keyboard: [[{ text: "📱 Share My Number", request_contact: true }]],
+        resize_keyboard: true,
+        one_time_keyboard: true,
+      },
+    });
     return;
   }
 
-  // /iou <plain text> — explicit NL payment trigger (works in DMs and groups).
+  // /join — only meaningful inside a group.
+  if (command === "/join") {
+    if (isPrivate) {
+      await ctx.reply("Use /join inside a money group to join it.");
+      return;
+    }
+    const groupId = String(ctx.chat.id);
+    if (await isRegistered(userId)) {
+      try {
+        await joinGroup({ telegramUserId: userId, telegramUsername: ctx.from?.username, groupTelegramId: groupId });
+        await ctx.reply(`✅ ${mention(ctx.from)} joined the money group. Others can now pay you.`);
+      } catch (error) {
+        console.error("joinGroup failed", error);
+        await ctx.reply("Couldn't add you right now — please try /join again in a moment.");
+      }
+    } else {
+      await ctx.reply(`${mention(ctx.from)}, tap below to set up your wallet — then you'll be added to this group.`, {
+        reply_markup: setupButton(groupId),
+      });
+    }
+    return;
+  }
+
+  // /iou <text> — explicit NL payment trigger (DMs and groups).
   if (command === "/iou") {
     if (isRegistrationStep(state.step)) {
       await ctx.reply("Finish setting up your account first. Send /start to begin.");
       return;
     }
-    const payload = text.slice(commandEntity!.offset + commandEntity!.length).trim();
+
+    // ── In a group: gate the sender, bounce the flow into their DM ──
+    if (!isPrivate) {
+      if (!afterCommand) {
+        await ctx.reply("Usage: /iou pay 50 to @alice");
+        return;
+      }
+      const groupId = String(ctx.chat.id);
+      if (!(await isRegistered(userId))) {
+        await ctx.reply(`${mention(ctx.from)}, set up your wallet first 👇`, { reply_markup: setupButton(groupId) });
+        return;
+      }
+      clearPaymentSession(state);
+      state.step = "idle";
+      state.originGroupChatId = ctx.chat.id;
+      await ctx.reply(`📩 ${mention(ctx.from)}, I've sent you a DM to confirm this payment.`);
+      try {
+        await runPlainText(ctx, state, userId, afterCommand, paymentContext(ctx), dmSend(ctx, userId));
+      } catch (error) {
+        console.error("group /iou DM bounce failed", error);
+        await ctx.reply(`${mention(ctx.from)}, I couldn't message you — open a chat with me first 👇`, {
+          reply_markup: setupButton(groupId),
+        });
+      }
+      return;
+    }
+
+    // ── In a DM ──
     clearPaymentSession(state);
     state.step = "idle";
-    if (!payload) {
+    if (!afterCommand) {
       await ctx.reply(
-        isPrivate
-          ? 'Tell me what you\'d like to pay — e.g. "pay 50 to @alice". You can write in any language.'
-          : "Usage: /iou pay 50 to @alice",
-        isPrivate ? { reply_markup: { force_reply: true } } : undefined
+        'Tell me what you\'d like to pay — e.g. "pay 50 to @alice". You can write in any language.',
+        { reply_markup: { force_reply: true } }
       );
       return;
     }
-    await runPlainText(ctx, state, userId, payload);
+    await runPlainText(ctx, state, userId, afterCommand, paymentContext(ctx), replySend(ctx));
     return;
   }
 
   if (command === "/pay") {
+    if (!isPrivate) {
+      await ctx.reply("Open a DM with me to use /pay, or use /iou pay … here in the group.");
+      return;
+    }
     if (isRegistrationStep(state.step)) {
       await ctx.reply("Finish setting up your account first. Send /start to begin.");
       return;
@@ -270,11 +413,14 @@ export async function handleBotMessage(ctx: any): Promise<void> {
   }
 
   if (command) {
-    await ctx.reply(`Unknown command: ${command}`);
+    if (isPrivate) await ctx.reply(`Unknown command: ${command}`);
     return;
   }
 
-  // Non-command text — dispatch on the current step
+  // Non-command text. In groups the bot ignores chatter (payments need /iou).
+  if (!isPrivate) return;
+
+  // ── DM, dispatch on the current step ──
   switch (state.step) {
     // ── Registration ────────────────────────────────────────────────────────
     case "awaiting_contact": {
@@ -319,11 +465,30 @@ export async function handleBotMessage(ctx: any): Promise<void> {
         userState.delete(userId);
         return;
       }
-      // Don't keep the key/password around in memory after registration
-      delete state.walletKey;
+      delete state.walletKey; // don't keep the key in memory after registration
+
+      // If they arrived via a group deep link, enrol them in that group now.
+      let joinedGroup = false;
+      if (state.pendingGroupId) {
+        try {
+          await joinGroup({
+            telegramUserId: userId,
+            telegramUsername: ctx.from?.username,
+            groupTelegramId: state.pendingGroupId,
+          });
+          joinedGroup = true;
+        } catch (error) {
+          console.error("joinGroup after registration failed", error);
+        }
+        delete state.pendingGroupId;
+      }
+
       state.step = "idle";
       await ctx.reply(
-        '✅ You\'re all set!\n\nJust tell me what you\'d like to pay — e.g. "send R50 to Noah" — in any language.',
+        (joinedGroup
+          ? "✅ You're all set and added to your money group!\n\n"
+          : "✅ You're all set!\n\n") +
+          'Just tell me what you\'d like to pay — e.g. "send R50 to Noah" — in any language.',
         { reply_markup: { remove_keyboard: true } }
       );
       return;
@@ -378,7 +543,7 @@ export async function handleBotMessage(ctx: any): Promise<void> {
         await ctx.reply("Something went wrong. Please try again.");
         return;
       }
-      await renderParseResult(ctx, state, result);
+      await renderParseResult(state, replySend(ctx), result);
       return;
     }
 
@@ -404,18 +569,15 @@ export async function handleBotMessage(ctx: any): Promise<void> {
 
       state.transactionId = auth.transactionId;
       state.step = "awaiting_approval";
-      await ctx.reply(
-        "Almost there — approve the payment in your wallet, then tap the button below.",
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🔐 Approve in wallet", url: auth.interactUrl }],
-              [{ text: "✅ I've approved", callback_data: "approved_payment" }],
-              [{ text: "❌ Cancel", callback_data: "cancel_payment" }],
-            ],
-          },
-        }
-      );
+      await ctx.reply("Almost there — approve the payment in your wallet, then tap the button below.", {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🔐 Approve in wallet", url: auth.interactUrl }],
+            [{ text: "✅ I've approved", callback_data: "approved_payment" }],
+            [{ text: "❌ Cancel", callback_data: "cancel_payment" }],
+          ],
+        },
+      });
       return;
     }
 
@@ -430,8 +592,7 @@ export async function handleBotMessage(ctx: any): Promise<void> {
     // ── Idle: in a DM, any plain text is a payment instruction ──────────────
     case "idle":
     default: {
-      if (!isPrivate) return; // groups: require /iou (group P2P is a later stage)
-      await runPlainText(ctx, state, userId, text);
+      await runPlainText(ctx, state, userId, text, paymentContext(ctx), replySend(ctx));
       return;
     }
   }
@@ -515,7 +676,7 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
       await ctx.reply("Couldn't build the payment. Please try /pay again.");
       return;
     }
-    await renderParseResult(ctx, state, result);
+    await renderParseResult(state, replySend(ctx), result);
     return;
   }
 
@@ -556,10 +717,26 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
       return;
     }
 
+    // Capture before clearing — needed for the public group announcement.
+    const groupId = state.originGroupChatId;
+    const payment = state.payment;
+    const payer = mention(ctx.from);
+
     clearPaymentSession(state);
     state.step = "idle";
+
     if (outcome.status === "COMPLETED") {
       await ctx.reply("✅ Payment sent successfully!");
+      if (groupId && payment) {
+        try {
+          await ctx.api.sendMessage(
+            groupId,
+            `💸 ${payer} paid ${payment.recipientDisplay} ${payment.amountDisplay} ${payment.currency} ✅`
+          );
+        } catch (error) {
+          console.error("group announcement failed", error);
+        }
+      }
     } else {
       await ctx.reply(`❌ Payment failed${outcome.detail ? `: ${outcome.detail}` : ""}. Send a new instruction to try again.`);
     }

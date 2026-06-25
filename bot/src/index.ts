@@ -6,7 +6,7 @@ loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
 import express from "express";
 import { Bot, webhookCallback } from "grammy";
-import { handleBotMessage, handleCallbackQuery } from "./handler";
+import { handleBotMessage, handleCallbackQuery, handleChatMemberUpdate } from "./handler";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Two ways to run the bot:
@@ -33,6 +33,8 @@ const bot = new Bot(token);
 // handleBotMessage inspects msg.contact / msg.text itself, so one listener covers both.
 bot.on("message", handleBotMessage);
 bot.on("callback_query:data", handleCallbackQuery);
+// Fires when the bot's own membership changes — used to welcome a new group.
+bot.on("my_chat_member", handleChatMemberUpdate);
 
 // Log (but don't crash on) errors thrown inside handlers.
 bot.catch((err) => {
@@ -42,6 +44,12 @@ bot.catch((err) => {
 async function main(): Promise<void> {
   // Make sure we know who we are (and fail fast on a bad token).
   const me = await bot.api.getMe();
+  // Handlers build group deep links (https://t.me/<username>?start=…) from this.
+  process.env.BOT_USERNAME = me.username;
+
+  // my_chat_member is included by default, but be explicit so the group
+  // welcome reliably fires alongside messages and button taps.
+  const allowedUpdates = ["message", "callback_query", "my_chat_member"] as const;
 
   if (webhookUrl) {
     // ── Webhook mode (ngrok / any public HTTPS host) ──────────────────────────
@@ -51,7 +59,7 @@ async function main(): Promise<void> {
     app.post("/webhook", webhookCallback(bot, "express"));
 
     app.listen(PORT, async () => {
-      await bot.api.setWebhook(`${webhookUrl}/webhook`);
+      await bot.api.setWebhook(`${webhookUrl}/webhook`, { allowed_updates: [...allowedUpdates] });
       console.log(`✓ @${me.username} listening on :${PORT}`);
       console.log(`✓ webhook registered → ${webhookUrl}/webhook`);
     });
@@ -59,6 +67,7 @@ async function main(): Promise<void> {
     // ── Long-polling mode (no public URL needed) ──────────────────────────────
     await bot.api.deleteWebhook(); // clear any stale webhook so polling works
     await bot.start({
+      allowed_updates: [...allowedUpdates],
       onStart: () => console.log(`✓ @${me.username} running (long-polling)`),
     });
   }

@@ -91,12 +91,36 @@ export async function processRegistration(payload: RegistrationPayload): Promise
   return postJson("/bot/processRegistration", payload);
 }
 
-/** POST /bot/processPlainText — RAW text in, constructed PaymentObject (or clarifications) out. */
+/** Where a message came from. In a group, the backend uses chatId to pull that
+ *  group's roster (groupMembers) and hand it to the AI parser, so a plain first
+ *  name like "jason" can be resolved to a registered member of THAT group. */
+export type ChatContext = { chatId: number; chatType: string };
+
+/** POST /bot/processPlainText — RAW text in, constructed PaymentObject (or clarifications) out.
+ *  `context` lets the backend scope recipient resolution to the originating group. */
 export async function processPlainText(payload: {
   telegramUserId: number;
   text: string;
+  context?: ChatContext;
 }): Promise<ParseResult> {
   return postJson<ParseResult>("/bot/processPlainText", payload);
+}
+
+/** POST /bot/checkUser — has this Telegram user finished registration (wallet set up)? */
+export async function checkUser(payload: {
+  telegramUserId: number;
+}): Promise<{ registered: boolean }> {
+  return postJson("/bot/checkUser", payload);
+}
+
+/** POST /bot/joinGroup — enrol a REGISTERED user in a group's roster (groupMembers).
+ *  Only registered users are added, so they're always payable once on the roster. */
+export async function joinGroup(payload: {
+  telegramUserId: number;
+  telegramUsername?: string;
+  groupTelegramId: string;
+}): Promise<{ ok: true }> {
+  return postJson("/bot/joinGroup", payload);
 }
 
 /** How a recipient is identified in the manual builder. "wallet" = out-of-ecosystem. */
