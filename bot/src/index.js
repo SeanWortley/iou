@@ -6,12 +6,13 @@ const app = express()
 const bot = new Bot(process.env.BOT_TOKEN)
 
 bot.on("message:text", (ctx) => {
+    console.log("Received:", ctx.message.text)
     ctx.reply(ctx.message.text) // echo
 })
-bot.on("message:text", (ctx) => {
-    console.log("Received:", ctx.message.text)
-    ctx.reply(ctx.message.text)
-})
+//bot.on("message:text", (ctx) => {
+//    console.log("Received:", ctx.message.text)
+//    ctx.reply(ctx.message.text)
+//})
 
 app.use(express.json())
 app.post("/webhook", webhookCallback(bot, "express"))
