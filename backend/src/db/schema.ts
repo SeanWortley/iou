@@ -1,135 +1,91 @@
 import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
 
-// TODO: Confirm with Danny these schema values (draft for now)
-
 export const users = sqliteTable('users', {
-  id: text('id').primaryKey(),
-  telegramId: text('telegram_id').unique(),
-  phoneNumber: text('phone_number').unique(),
-  displayName: text('display_name'),
-  walletAddress: text('wallet_address'),
-  createdAt: integer('created_at', { mode: 'timestamp' }),
-});
+  id:                     text('id').primaryKey(),
+  telegramId:             text('telegram_id').notNull().unique(),
+  telegramUsername:       text('telegram_username').unique(), // @username — nullable, not all Telegram users set one
+  displayName:            text('display_name').notNull(),
+  phoneNumber:            text('phone_number').notNull().unique(),
+  passwordHash:           text('password_hash'),
+  walletAddress:          text('wallet_address'),
 
-export const transactions = sqliteTable('transactions', {
-  id: text('id').primaryKey(),
-  senderTelegramId: text('sender_telegram_id').notNull(),
-  receiverTelegramId: text('receiver_telegram_id').notNull(),
-  amount: text('amount').notNull(),
-  currency: text('currency').notNull(),
-  status: text('status').notNull(),
-  telegramChatId: text('telegram_chat_id').notNull(),
-  grantContinueUri: text('grant_continue_uri'),
-  grantContinueToken: text('grant_continue_token'),
-  interactNonce: text('interact_nonce'),
-});
+  // Cached from the wallet server-info endpoint on first payment — avoids a
+  // network round-trip on every send. Null until populated after first use.
+  assetCode:              text('asset_code'),    // e.g. "ZAR"
+  assetScale:             integer('asset_scale'), // e.g. 2 → amounts stored in cents
 
-// TODO: END OF TODO
+  // Wrong password increments the counter; hitting the limit sets lockedUntil.
+  // Both reset to 0 / null on a successful password check.
+  failedPasswordAttempts: integer('failed_password_attempts').notNull().default(0),
+  lockedUntil:            integer('locked_until', { mode: 'timestamp' }),
+
+  // Interledger private key — encrypted with AES-256-GCM using a key derived
+  // from the user's payment password via PBKDF2. Never stored in plaintext.
+  // To decrypt: PBKDF2(password, privateKeySalt) → AES.decrypt(ciphertext, derivedKey, IV)
+  // Changing the password requires re-encrypting all three of these fields.
+  privateKeyEncrypted:    text('private_key_encrypted'),  // AES-256-GCM ciphertext (base64)
+  privateKeyIv:           text('private_key_iv'),         // AES initialisation vector (base64)
+  privateKeySalt:         text('private_key_salt'),       // PBKDF2 salt (base64)
+
+  createdAt:              integer('created_at', { mode: 'timestamp' }).notNull(),
+});
 
 export type User    = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 
-export type Transaction      = typeof transactions.$inferSelect;
-export type NewTransaction   = typeof transactions.$inferInsert;
-
-// A payment request ("ask"): the requester asks the payer to send them money.
-// Pure DB record — no Open Payments resources exist until the payer fulfils it
-// (quotes and incoming payments expire; an ask can sit for days).
-export const paymentRequests = sqliteTable('payment_requests', {
-  id:            text('id').primaryKey(),               // crypto.randomUUID()
-
-  requesterId:   text('requester_id').notNull().references(() => users.id), // who gets paid
-  payerId:       text('payer_id').notNull().references(() => users.id),     // who is asked to pay
-
-  // FIXED_SEND:    payer sends exactly `amount` (denominated in the payer's currency)
-  // FIXED_RECEIVE: requester receives exactly `amount` (denominated in the requester's currency)
-  paymentType:   text('payment_type').notNull(),
-
-  amount:        text('amount').notNull(),               // smallest asset unit, string
-  assetCode:     text('asset_code').notNull(),           // currency the amount is denominated in
-  assetScale:    integer('asset_scale').notNull(),
-
-  note:          text('note'),                           // optional message to the payer
-
-  // PENDING → COMPLETED | DECLINED | CANCELLED.
-  // A failed payment leaves the ask PENDING so the payer can retry.
-  status:        text('status').notNull(),
-
-  // Set when the payer starts fulfilment; the /api/callback handler marks the
-  // ask COMPLETED when this transaction's outgoing payment succeeds.
-  transactionId: text('transaction_id').references(() => transactions.id),
-
-  createdAt:     integer('created_at', { mode: 'timestamp' }).notNull(),
-  updatedAt:     integer('updated_at', { mode: 'timestamp' }).notNull(),
+// Tracks which registered users the bot has seen in each group chat.
+// Populated organically: every time a registered user sends a message in a group
+// where the bot is present, upsert their row here.
+// Used for group-chat name lookup: "send Noah R50" → search only within this group.
+export const groupMembers = sqliteTable('group_members', {
+  id:              text('id').primaryKey(),
+  groupTelegramId: text('group_telegram_id').notNull(), // Telegram's chat ID for the group
+  userId:          text('user_id').notNull().references(() => users.id),
+  lastSeenAt:      integer('last_seen_at', { mode: 'timestamp' }).notNull(),
 });
 
-export type PaymentRequest    = typeof paymentRequests.$inferSelect;
-export type NewPaymentRequest = typeof paymentRequests.$inferInsert;
+export type GroupMember    = typeof groupMembers.$inferSelect;
+export type NewGroupMember = typeof groupMembers.$inferInsert;
 
-// A monetized news post by a seeded journalist. The excerpt is always visible;
-// the body is paywalled. Readers pay a one-off Web Monetization payment — the
-// reader is the payer, the app's configured wallet (OP_WALLET_ADDRESS) is the
-// "monetization receiver" (the journalist's payout) — to unlock the body.
-export const posts = sqliteTable('posts', {
-  id:           text('id').primaryKey(),
+export const transactions = sqliteTable('transactions', {
+  id:                    text('id').primaryKey(),
 
-  authorName:   text('author_name').notNull(),
-  authorAvatar: text('author_avatar'),            // base64 data URL, or null for an initials placeholder
-  title:        text('title').notNull(),
-  excerpt:      text('excerpt').notNull(),         // free preview, always returned
-  body:         text('body').notNull(),            // paywalled — only returned once unlocked
-  category:     text('category'),
+  // PENDING → AWAITING_GRANT → COMPLETED | FAILED
+  status:                text('status').notNull(),
 
-  // Price in MAJOR units (e.g. "0.10"). The unlock route resolves the receiver
-  // wallet's live currency/scale and converts — so seeds don't hard-code a currency.
-  price:        text('price').notNull(),
+  // FIXED_SEND: sender specifies debitAmount
+  // FIXED_RECEIVE: receiver specifies incomingAmount
+  paymentType:           text('payment_type').notNull(),
 
-  // The "special" continuously-streaming article: payments stream live while the
-  // reader is on the page, up to `streamLimit` (MAJOR units), then the session
-  // stops. `freeToRead` posts return their body without an unlock. Nullable
-  // (treated as false) so the column add is a plain, non-interactive migration.
-  streaming:    integer('streaming', { mode: 'boolean' }),
-  freeToRead:   integer('free_to_read', { mode: 'boolean' }),
-  streamLimit:  text('stream_limit'),
+  senderWalletAddress:   text('sender_wallet_address').notNull(),
+  receiverWalletAddress: text('receiver_wallet_address').notNull(),
 
-  createdAt:    integer('created_at', { mode: 'timestamp' }).notNull(),
+  // Amounts in smallest asset unit (e.g. cents); strings to avoid float drift
+  debitAmount:           text('debit_amount'),   // what the sender pays
+  receiveAmount:         text('receive_amount'),  // what the receiver gets
+  assetCode:             text('asset_code').notNull(),
+  assetScale:            integer('asset_scale').notNull(),
+  receiveAssetCode:      text('receive_asset_code'),
+  receiveAssetScale:     integer('receive_asset_scale'),
+
+  // Open Payments resource URLs returned by the SDK
+  incomingPaymentUrl:    text('incoming_payment_url'),
+  quoteUrl:              text('quote_url'),
+  outgoingPaymentUrl:    text('outgoing_payment_url'),
+
+  // Quotes are time-limited; past this the transaction is effectively dead
+  quoteExpiresAt:        integer('quote_expires_at', { mode: 'timestamp' }),
+
+  // GNAP grant continuation — persisted so the /api/callback handler can resume
+  grantContinueUri:      text('grant_continue_uri'),
+  grantContinueToken:    text('grant_continue_token'),
+  grantInteractNonce:    text('grant_interact_nonce'),
+
+  userId:                text('user_id').references(() => users.id),
+  errorMessage:          text('error_message'),
+  createdAt:             integer('created_at', { mode: 'timestamp' }).notNull(),
+  updatedAt:             integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
-export type Post    = typeof posts.$inferSelect;
-export type NewPost = typeof posts.$inferInsert;
-
-// One reader's unlock of one post. Mirrors payment_requests: a PENDING row is
-// created when the reader starts the unlock and linked to a transaction; the
-// /api/callback handler flips it to COMPLETED when the outgoing payment lands.
-// One row per (postId, userId) — reused across retries.
-export const postUnlocks = sqliteTable('post_unlocks', {
-  id:            text('id').primaryKey(),
-
-  postId:        text('post_id').notNull().references(() => posts.id),
-  userId:        text('user_id').notNull().references(() => users.id),
-
-  // How the unlock was paid for:
-  //   WEB_MONETIZATION — streamed via the browser's <link rel="monetization"> provider
-  //   OPEN_PAYMENTS    — one-off fallback payment (grant → consent → outgoing)
-  method:        text('method'),
-
-  // OPEN_PAYMENTS only: set when the reader starts the unlock; /api/callback marks
-  // the unlock COMPLETED when this transaction's outgoing payment succeeds.
-  transactionId: text('transaction_id').references(() => transactions.id),
-
-  // WEB_MONETIZATION only: the incoming-payment URL from the MonetizationEvent and
-  // the amount the receiver confirmed (smallest unit), for the on-page receipt.
-  wmIncomingPayment: text('wm_incoming_payment'),
-  wmAmountValue:     text('wm_amount_value'),
-  wmAssetCode:       text('wm_asset_code'),
-  wmAssetScale:      integer('wm_asset_scale'),
-
-  // PENDING → COMPLETED. A failed/cancelled payment leaves it PENDING for a retry.
-  status:        text('status').notNull(),
-
-  createdAt:     integer('created_at', { mode: 'timestamp' }).notNull(),
-  updatedAt:     integer('updated_at', { mode: 'timestamp' }).notNull(),
-});
-
-export type PostUnlock    = typeof postUnlocks.$inferSelect;
-export type NewPostUnlock = typeof postUnlocks.$inferInsert;
+export type Transaction    = typeof transactions.$inferSelect;
+export type NewTransaction = typeof transactions.$inferInsert;

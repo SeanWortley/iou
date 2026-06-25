@@ -46,22 +46,28 @@ bot.on('message:contact', async (ctx) => {
   const telegramId = ctx.from.id.toString();
   const displayName = ctx.from.first_name || 'User';
 
+  const telegramUsername = ctx.from.username ? `@${ctx.from.username}` : null;
+
   try {
     const existingUser = await db.select().from(users).where(eq(users.telegramId, telegramId)).get();
 
     if (existingUser) {
-      await db.update(users).set({ phoneNumber }).where(eq(users.telegramId, telegramId));
+      await db.update(users).set({
+        phoneNumber,
+        telegramUsername
+      }).where(eq(users.telegramId, telegramId));
     } else {
       await db.insert(users).values({
         id: crypto.randomUUID(),
         telegramId,
+        telegramUsername,
         phoneNumber,
         displayName,
         createdAt: new Date()
       });
     }
 
-    await ctx.reply(`Thank you! Your phone number ${phoneNumber} is linked. Now, please set up your Open Payments wallet address by typing:\n\n/register <wallet_address>`);
+    await ctx.reply(`Thank you! Your phone number ${phoneNumber} is linked. Now, please set up your Open Payments wallet address by typing:\n\n/linkwallet <wallet_address>`);
   } catch (error) {
     console.error("DB Register Error:", error);
     await ctx.reply("Something went wrong saving your contact info. Please try again.");
@@ -109,6 +115,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Bot Webhook Route
+// To comment out if want to test
 app.post('/api/bot-webhook', webhookCallback(bot, 'express'));
 
 app.use('/api/auth', authRouter);
@@ -126,5 +133,8 @@ seedNews().catch((err) => console.error('[seed] News seed failed:', err));
 app.listen(config.port, () => {
   console.log(`\n  OpenRemit backend with Bot Support → http://localhost:${config.port}\n`);
 });
+
+// bot.start();
+// console.log("Polling mode activated: Bot is listening directly to Telegram!");
 
 export { bot };
