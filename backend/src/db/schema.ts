@@ -1,61 +1,33 @@
 import { sqliteTable, text, integer } from 'drizzle-orm/sqlite-core';
 
+// TODO: Confirm with Danny these schema values (draft for now)
+
 export const users = sqliteTable('users', {
-  id:           text('id').primaryKey(),
-  displayName:  text('display_name').notNull(),
-  email:        text('email').notNull().unique(),
-  passwordHash: text('password_hash').notNull(),
-  avatar:       text('avatar'),              // base64 data URL
-  walletAddress: text('wallet_address'),     // set after signup
-  createdAt:    integer('created_at', { mode: 'timestamp' }).notNull(),
+  id: text('id').primaryKey(),
+  telegramId: text('telegram_id').unique(),
+  phoneNumber: text('phone_number').unique(),
+  displayName: text('display_name'),
+  walletAddress: text('wallet_address'),
+  createdAt: integer('created_at', { mode: 'timestamp' }),
 });
+
+export const transactions = sqliteTable('transactions', {
+  id: text('id').primaryKey(),
+  senderTelegramId: text('sender_telegram_id').notNull(),
+  receiverTelegramId: text('receiver_telegram_id').notNull(),
+  amount: text('amount').notNull(),
+  currency: text('currency').notNull(),
+  status: text('status').notNull(),
+  telegramChatId: text('telegram_chat_id').notNull(),
+  grantContinueUri: text('grant_continue_uri'),
+  grantContinueToken: text('grant_continue_token'),
+  interactNonce: text('interact_nonce'),
+});
+
+// TODO: END OF TODO
 
 export type User    = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
-
-export const transactions = sqliteTable('transactions', {
-  id:                    text('id').primaryKey(),         // crypto.randomUUID()
-
-  // PENDING → AWAITING_GRANT → COMPLETED | FAILED
-  status:                text('status').notNull(),
-
-  // FIXED_SEND: sender specifies debitAmount
-  // FIXED_RECEIVE: receiver specifies incomingAmount
-  paymentType:           text('payment_type').notNull(),
-
-  // Canonical https:// wallet address URLs
-  senderWalletAddress:   text('sender_wallet_address').notNull(),
-  receiverWalletAddress: text('receiver_wallet_address').notNull(),
-
-  // Amounts in smallest asset unit (e.g. cents for USD); strings to avoid float drift
-  debitAmount:           text('debit_amount'),            // what the sender pays
-  receiveAmount:         text('receive_amount'),          // what the receiver gets
-  assetCode:             text('asset_code').notNull(),    // sender's currency, e.g. USD
-  assetScale:            integer('asset_scale').notNull(),// sender's scale, e.g. 2 (cents)
-  receiveAssetCode:      text('receive_asset_code'),      // receiver's currency (may differ)
-  receiveAssetScale:     integer('receive_asset_scale'),  // receiver's scale
-
-  // Open Payments resource URLs — full canonical URLs returned by the SDK
-  incomingPaymentUrl:    text('incoming_payment_url'),
-  quoteUrl:              text('quote_url'),
-  outgoingPaymentUrl:    text('outgoing_payment_url'),
-
-  // When the quote stops being usable. The outgoing payment at /callback needs a
-  // live quote, so a still-PENDING/AWAITING_GRANT row past this is effectively
-  // dead — the frontend surfaces it as "Expired". Nullable: quotes may omit it.
-  quoteExpiresAt:        integer('quote_expires_at', { mode: 'timestamp' }),
-
-  // GNAP grant continuation — persisted so the /api/callback handler can resume
-  grantContinueUri:      text('grant_continue_uri'),
-  grantContinueToken:    text('grant_continue_token'),
-  grantInteractNonce:    text('grant_interact_nonce'),
-
-  userId:                text('user_id').references(() => users.id),
-
-  errorMessage:          text('error_message'),
-  createdAt:             integer('created_at', { mode: 'timestamp' }).notNull(),
-  updatedAt:             integer('updated_at', { mode: 'timestamp' }).notNull(),
-});
 
 export type Transaction      = typeof transactions.$inferSelect;
 export type NewTransaction   = typeof transactions.$inferInsert;
