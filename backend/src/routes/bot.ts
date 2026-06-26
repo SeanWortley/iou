@@ -13,6 +13,7 @@ interface PaymentSession {
     amount: number;
     currency: string;
     recipientWallet: string;
+    paymentType: 'FIXED_SEND' | 'FIXED_RECEIVE';
 }
 const activeSessions = new Map<string, PaymentSession>();
 
@@ -75,52 +76,42 @@ router.post('/processPlainText', async (req, res) => {
         const isGroup = context?.chatType === 'group' || context?.chatType === 'supergroup';
         const groupTelegramId = context?.chatId?.toString();
 
-        // 1. DYNAMICALLY BUILD THE ROSTER FROM SQLITE [1]
-        // If we are in a group chat, grab the display names of all registered users in this group! [1]
         let groupRoster: string[] = [];
         if (isGroup && groupTelegramId) {
             const members = await db.select({ displayName: users.displayName })
                 .from(users)
                 .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
                 .where(eq(groupMembers.groupTelegramId, groupTelegramId))
-                .all(); // .all() gets the list of rows
-
-            // Map DB rows to a string list: ["@Noah_99", "@Sizwe", ...] [1]
+                .all();
             groupRoster = members.map(m => m.displayName).filter((name): name is string => !!name);
         }
 
-        // 2. Call their FastAPI endpoint on '/parse' [1]
         const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
-
-        // We send the EXACT keys their UserRequest BaseModel expects! [1]
         const aiResponse = await axios.post(aiServerUrl, {
-            text: text,
+            text,
             chat_event: telegramMessage || {},
-            group_roster: groupRoster // Passes the real SQLite group roster dynamically [1]
+            group_roster: groupRoster
         });
 
-        const intentData = aiResponse.data; // This is the structured PaymentIntent JSON! [1]
-
+        const intentData = aiResponse.data;
         const sessionId = crypto.randomUUID();
 
         if (intentData.intent !== 'PAYMENT') {
             return res.json({ status: 'error', reason: 'Only payment instructions are supported right now.' });
         }
 
-        // Retrieve the transaction details from the first item of their extracted list [1]
         const extractedTx = intentData.transactions?.[0];
         if (!extractedTx || !extractedTx.recipients?.length) {
             return res.json({ status: 'error', reason: 'Could not detect who you want to pay.' });
         }
 
-        const recipientQuery = extractedTx.recipients[0].trim(); // First recipient [1]
+        const recipientQuery = extractedTx.recipients[0].trim();
         const amount = extractedTx.amount;
 
         if (!amount || amount <= 0) {
             return res.json({ status: 'error', reason: 'Please specify a valid payment amount.' });
         }
 
-        // 3. Resolve the recipient globally or within group [1]
         let matchedUser = null;
         if (isGroup && groupTelegramId) {
             matchedUser = await db.select({
@@ -150,11 +141,24 @@ router.post('/processPlainText', async (req, res) => {
             });
         }
 
-        // Save to our active payment sessions map [1]
+        // RESOLVE SENDER PROFILE FOR CURRENCY COMPARISON [1]
+        const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        const senderWalletUrl = sender?.walletAddress ? normalizeWalletAddress(sender.walletAddress) : '';
+
+        const client = await getClient();
+        const senderWallet = await client.walletAddress.get({ url: senderWalletUrl });
+        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(matchedUser.walletAddress) });
+
+        // DYNAMIC DECISION: If they didn't specify a foreign currency, default to FIXED_SEND of their native currency [1]
+        const wantsForeignExplicitly = extractedTx.target_currency && extractedTx.target_currency !== senderWallet.assetCode;
+        const paymentType = wantsForeignExplicitly ? 'FIXED_RECEIVE' : 'FIXED_SEND';
+        const currency = wantsForeignExplicitly ? receiverWallet.assetCode : senderWallet.assetCode;
+
         activeSessions.set(sessionId, {
             amount,
-            currency: extractedTx.target_currency || 'ZAR',
-            recipientWallet: matchedUser.walletAddress
+            currency,
+            recipientWallet: matchedUser.walletAddress,
+            paymentType
         });
 
         return res.json({
@@ -162,7 +166,7 @@ router.post('/processPlainText', async (req, res) => {
             sessionId,
             payment: {
                 amountDisplay: amount.toFixed(2),
-                currency: extractedTx.target_currency || 'ZAR',
+                currency,
                 recipientDisplay: matchedUser.displayName,
                 recipientWallet: matchedUser.walletAddress
             }
@@ -215,13 +219,11 @@ router.post('/authorizePayment', async (req, res) => {
             return res.status(404).json({ error: 'Sender not registered.' });
         }
 
-        // Verify Password
         const derivedHash = crypto.createHash('sha256').update(password).digest('hex');
         if (derivedHash !== sender.passwordHash) {
             return res.status(401).json({ error: 'Invalid password' });
         }
 
-        // Retrieve active session details [1]
         const session = activeSessions.get(sessionId);
         if (!session) {
             return res.status(400).json({ error: 'Session expired or invalid.' });
@@ -229,15 +231,10 @@ router.post('/authorizePayment', async (req, res) => {
 
         const client = await getClient();
 
-        // Resolve wallets
-        const senderWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(sender.walletAddress)
-        });
-        const receiverWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(session.recipientWallet) // Wrapped here! [1]
-        });
+        const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress) });
+        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(session.recipientWallet) });
 
-        // Request incoming-payment grant
+        // Step A: Request incoming-payment grant
         const incomingGrant = await client.grant.request(
             { url: receiverWallet.authServer },
             { access_token: { access: [{ type: 'incoming-payment', actions: ['create', 'read'] }] } }
@@ -247,41 +244,72 @@ router.post('/authorizePayment', async (req, res) => {
             throw new Error('Expected non-interactive incoming payment grant');
         }
 
-        // Calculate scale dynamically
-        const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
-        const amountInScale = Math.round(session.amount * scaleMultiplier).toString();
+        let incomingPayment;
+        let quote;
 
-        // Create incoming payment
-        const incomingPayment = await client.incomingPayment.create(
-            { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
-            {
-                walletAddress: receiverWallet.id,
-                incomingAmount: { value: amountInScale, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale }
+        if (session.paymentType === 'FIXED_RECEIVE') {
+            // 🎯 FIXED RECEIVE FLOW: Receiver must get exactly X in their currency [1]
+            const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
+            const amountInScale = Math.round(session.amount * scaleMultiplier).toString();
+
+            incomingPayment = await client.incomingPayment.create(
+                { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+                {
+                    walletAddress: receiverWallet.id,
+                    incomingAmount: { value: amountInScale, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale }
+                }
+            );
+
+            const quoteGrant = await client.grant.request(
+                { url: senderWallet.authServer },
+                { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
+            );
+
+            if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
+                throw new Error('Expected non-interactive quote grant');
             }
-        );
 
-        // Request quote grant
-        const quoteGrant = await client.grant.request(
-            { url: senderWallet.authServer },
-            { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
-        );
+            quote = await client.quote.create(
+                { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+                {
+                    walletAddress: senderWallet.id,
+                    receiveAmount: incomingPayment.incomingAmount,
+                    receiver: incomingPayment.id,
+                    method: 'ilp'
+                }
+            );
+        } else {
+            // 💸 FIXED SEND FLOW: Sender pays exactly X in their currency [1]
+            const scaleMultiplier = Math.pow(10, senderWallet.assetScale);
+            const amountInScale = Math.round(session.amount * scaleMultiplier).toString();
 
-        if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
-            throw new Error('Expected non-interactive quote grant');
+            // For fixed send, we do not restrict the incoming payment amount on creation [1]
+            incomingPayment = await client.incomingPayment.create(
+                { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+                { walletAddress: receiverWallet.id }
+            );
+
+            const quoteGrant = await client.grant.request(
+                { url: senderWallet.authServer },
+                { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
+            );
+
+            if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
+                throw new Error('Expected non-interactive quote grant');
+            }
+
+            // We specify debitAmount on the quote instead of receiveAmount [1]
+            quote = await client.quote.create(
+                { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+                {
+                    walletAddress: senderWallet.id,
+                    debitAmount: { value: amountInScale, assetCode: senderWallet.assetCode, assetScale: senderWallet.assetScale },
+                    receiver: incomingPayment.id,
+                    method: 'ilp'
+                }
+            );
         }
 
-        // Create quote
-        const quote = await client.quote.create(
-            { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
-            {
-                walletAddress: senderWallet.id,
-                receiveAmount: incomingPayment.incomingAmount,
-                receiver: incomingPayment.id,
-                method: 'ilp'
-            }
-        );
-
-        // Request interactive outgoing payment grant
         const interactNonce = crypto.randomUUID();
         const txId = crypto.randomUUID();
         const callbackUrl = `${process.env.BACKEND_URL}/api/callback?transactionId=${txId}`;
@@ -310,12 +338,12 @@ router.post('/authorizePayment', async (req, res) => {
             await db.insert(transactions).values({
                 id: txId,
                 status: 'AWAITING_GRANT',
-                paymentType: 'FIXED_SEND',
+                paymentType: session.paymentType,
                 senderWalletAddress: senderWallet.id,
                 receiverWalletAddress: receiverWallet.id,
-                debitAmount: amountInScale,
-                assetCode: receiverWallet.assetCode,
-                assetScale: receiverWallet.assetScale,
+                debitAmount: quote.debitAmount.value,
+                assetCode: senderWallet.assetCode,
+                assetScale: senderWallet.assetScale,
                 incomingPaymentUrl: incomingPayment.id,
                 quoteUrl: quote.id,
 
@@ -352,10 +380,8 @@ router.post('/buildPayment', async (req, res) => {
         let recipientWallet = '';
         let recipientName = 'External Wallet';
 
-        // Uncomment getClient at the top of your imports if you commented it out! [1]
         const client = await getClient();
 
-        // 1. Resolve recipient based on the manual builder selection [1]
         if (recipient.type === 'phone') {
             const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipient.value.trim())).get();
             if (!matchedUser || !matchedUser.walletAddress) {
@@ -374,7 +400,6 @@ router.post('/buildPayment', async (req, res) => {
             recipientName = matchedUser.displayName || 'Registered User';
         }
         else if (recipient.type === 'wallet') {
-            // Direct out-of-ecosystem payment to a raw wallet pointer [1]
             recipientWallet = recipient.value.trim();
             try {
                 const resolvedWallet = await client.walletAddress.get({ url: recipientWallet });
@@ -384,17 +409,24 @@ router.post('/buildPayment', async (req, res) => {
             }
         }
 
-        const receiverWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(recipientWallet)
-        });
-        const currency = receiverWallet.assetCode; // e.g. "USD" or "ZAR"
+        const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        if (!sender) {
+            return res.status(404).json({ error: 'Sender not registered.' });
+        }
+
+        const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress!) });
+        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(recipientWallet) });
+
+        // FIX 1: Correctly resolve currency based on paymentType! [1]
+        const currency = (paymentType === 'FIXED_SEND') ? senderWallet.assetCode : receiverWallet.assetCode;
 
         const sessionId = crypto.randomUUID();
 
         activeSessions.set(sessionId, {
             amount: parseFloat(amount),
             currency,
-            recipientWallet
+            recipientWallet,
+            paymentType: paymentType as 'FIXED_SEND' | 'FIXED_RECEIVE'
         });
 
         return res.json({
