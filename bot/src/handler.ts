@@ -2,7 +2,6 @@ import {
   authorizePayment,
   buildPayment,
   checkUser,
-  clarifyPayment,
   confirmPayment,
   finalizePayment,
   joinGroup,
@@ -210,6 +209,24 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
     state.clarifications = result.clarifications;
     state.step = "awaiting_clarification";
     const next = result.clarifications[0];
+    // Reset any half-built manual fields; each pathway repopulates what it knows.
+    delete state.recipientType;
+    delete state.manualRecipient;
+    delete state.manualAmount;
+
+    // Intent: the AI couldn't tell what the user wants → offer actions as buttons.
+    if (next?.field === "intent") {
+      await send(next?.question ?? "What would you like to do?", {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "💸 Make a payment", callback_data: "clarify_pay" }],
+            [{ text: "💰 Check balance", callback_data: "clarify_balance" }],
+            [{ text: "✖️ Never mind", callback_data: "cancel_payment" }],
+          ],
+        },
+      });
+      return;
+    }
 
     // Currency mismatch: the stated currency matches neither wallet. Offer the two
     // wallet currencies as inline buttons — sender's currency → fixed-send, the
@@ -234,10 +251,22 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
       return;
     }
 
+    // Amount: recipient known, amount missing → remember the wallet, ask the number.
+    if (next?.field === "amount" && result.payment?.recipientWallet) {
+      state.recipientType = "wallet";
+      state.manualRecipient = result.payment.recipientWallet;
+      await send(next?.question ?? "How much? (numbers only, e.g. 50)", {
+        reply_markup: { force_reply: true },
+      });
+      return;
+    }
+
+    // Recipient (default): amount may be known; ask who, offering roster suggestions.
+    if (result.payment?.amountDisplay) state.manualAmount = result.payment.amountDisplay;
     const reply_markup = next?.suggestions?.length
       ? { keyboard: next.suggestions.map((s) => [{ text: s }]), resize_keyboard: true, one_time_keyboard: true }
       : { force_reply: true };
-    await send(next?.question ?? "Could you clarify that?", { reply_markup });
+    await send(next?.question ?? "Who would you like to pay?", { reply_markup });
     return;
   }
 
@@ -246,6 +275,26 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
   state.clarifications = undefined;
   state.step = "awaiting_confirmation";
   await send(formatPayment(result.payment), { reply_markup: confirmKeyboard });
+}
+
+// Finish a clarification by handing the resolved recipient + amount to the
+// existing buildPayment route, then render its Confirm / Cancel card.
+async function completeViaBuild(
+  ctx: any,
+  state: UserState,
+  userId: number,
+  recipient: { type: RecipientType; value: string },
+  amount: string,
+): Promise<void> {
+  let result: ParseResult;
+  try {
+    result = await buildPayment({ telegramUserId: userId, recipient, amount, paymentType: "FIXED_SEND" });
+  } catch (error) {
+    console.error("buildPayment (clarify) failed", error);
+    await ctx.reply("Couldn't build the payment. Please try again.");
+    return;
+  }
+  await renderParseResult(state, replySend(ctx), result);
 }
 
 // Manual builder: recipient captured (typed or shared) → ask for the amount.
@@ -593,24 +642,51 @@ export async function handleBotMessage(ctx: any): Promise<void> {
     // ── Payment (shared tail) ───────────────────────────────────────────────
     case "awaiting_clarification": {
       const field = state.clarifications?.[0]?.field ?? "unknown";
+
+      // Button-driven pathways — ignore stray text, nudge to the buttons.
       if (field === "currency") {
         await ctx.reply("Please tap one of the currency buttons above.");
         return;
       }
-      let result: ParseResult;
-      try {
-        result = await clarifyPayment({
-          telegramUserId: userId,
-          sessionId: state.sessionId ?? "",
-          field,
-          answer: text,
-        });
-      } catch (error) {
-        console.error("clarifyPayment failed", error);
-        await ctx.reply("Something went wrong. Please try again.");
+      if (field === "intent") {
+        await ctx.reply("Please tap one of the buttons above.");
         return;
       }
-      await renderParseResult(state, replySend(ctx), result);
+
+      // Amount answer: validate, then complete with the remembered recipient.
+      if (field === "amount") {
+        if (!/^\d+(\.\d+)?$/.test(text) || Number(text) <= 0) {
+          await ctx.reply("Please enter a positive number, e.g. 50 or 50.00.", {
+            reply_markup: { force_reply: true },
+          });
+          return;
+        }
+        if (!state.manualRecipient || !state.recipientType) {
+          clearPaymentSession(state);
+          state.step = "idle";
+          await ctx.reply("Let's start over — tell me what you'd like to pay.");
+          return;
+        }
+        await completeViaBuild(ctx, state, userId, { type: state.recipientType, value: state.manualRecipient }, text);
+        return;
+      }
+
+      // Recipient answer (typed or tapped): infer how they're identified.
+      const value = text.trim();
+      const type: RecipientType = /^\+?\d[\d\s-]*$/.test(value)
+        ? "phone"
+        : value.startsWith("http") || value.startsWith("$")
+          ? "wallet"
+          : "username";
+      if (!state.manualAmount) {
+        // No amount yet either → hand off to the manual amount step.
+        state.recipientType = type;
+        state.manualRecipient = value;
+        state.step = "awaiting_manual_amount";
+        await ctx.reply("💸 How much? (numbers only, e.g. 50):", { reply_markup: { force_reply: true } });
+        return;
+      }
+      await completeViaBuild(ctx, state, userId, { type, value }, state.manualAmount);
       return;
     }
 
@@ -672,6 +748,22 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
     state.step = "idle";
     await ctx.answerCallbackQuery("Cancelled");
     await ctx.reply("Payment cancelled. Send a new instruction whenever you're ready.");
+    return;
+  }
+
+  // Intent clarification: route the chosen action.
+  if (callbackData === "clarify_pay") {
+    clearPaymentSession(state);
+    state.step = "idle";
+    await ctx.answerCallbackQuery();
+    await ctx.reply('Tell me what you\'d like to pay — e.g. "pay 50 to @alice".', {
+      reply_markup: { force_reply: true },
+    });
+    return;
+  }
+  if (callbackData === "clarify_balance") {
+    await ctx.answerCallbackQuery();
+    await ctx.reply("💰 Balance checking isn't available yet — coming soon!");
     return;
   }
 
