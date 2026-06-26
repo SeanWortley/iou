@@ -82,11 +82,11 @@ export type RegistrationPayload = {
   telegramUsername?: string;
   phoneNumber: string;
   walletAddress: string;
-  privateKey: string;
-  password: string;
 };
 
-/** POST /bot/processRegistration — encrypt the key with the password and store the user. */
+/** POST /bot/processRegistration — store the user and their wallet address.
+ *  Payments are made by a custodial client wallet on the user's behalf, so we no
+ *  longer collect (or store) the user's private key or a payment password. */
 export async function processRegistration(payload: RegistrationPayload): Promise<{ ok: true }> {
   return postJson("/bot/processRegistration", payload);
 }
@@ -164,13 +164,12 @@ export async function confirmPayment(payload: {
 
 /**
  * POST /bot/authorizePayment — the Open Payments flow begins here.
- * The backend decrypts the user's key with `password`, runs the quote, requests
- * the interactive outgoing-payment grant, and returns the wallet approval link.
+ * The custodial client wallet runs the quote and requests the interactive
+ * outgoing-payment grant, returning the wallet approval link the sender opens.
  */
 export async function authorizePayment(payload: {
   telegramUserId: number;
   sessionId: string;
-  password: string;
 }): Promise<{ interactUrl: string; transactionId: string }> {
   return postJson("/bot/authorizePayment", payload);
 }
