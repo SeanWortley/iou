@@ -184,7 +184,12 @@ async function runPlainText(
 ): Promise<void> {
   let result: ParseResult;
   try {
-    result = await processPlainText({ telegramUserId: userId, text, context });
+    result = await processPlainText({
+      telegramUserId: userId,
+      text,
+      context,
+      telegramMessage: ctx.message
+    });
   } catch (error) {
     console.error("processPlainText failed", error);
     await send("I couldn't reach the payment service. Please try again in a moment.");

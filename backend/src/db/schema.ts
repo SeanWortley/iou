@@ -6,8 +6,8 @@ export const users = sqliteTable('users', {
   telegramUsername:       text('telegram_username').unique(), // @username — nullable, not all Telegram users set one
   displayName:            text('display_name').notNull(),
   phoneNumber:            text('phone_number').notNull().unique(),
-  passwordHash:           text('password_hash').notNull(),
-  walletAddress:          text('wallet_address').notNull(),
+  passwordHash:           text('password_hash'),
+  walletAddress:          text('wallet_address'),
 
   // Cached from the wallet server-info endpoint on first payment — avoids a
   // network round-trip on every send. Null until populated after first use.
