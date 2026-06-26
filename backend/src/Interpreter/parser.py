@@ -39,12 +39,12 @@ class TransactionDetail(BaseModel):
         None, description="The exact numerical amount to be sent."
     )
     source_currency: str = Field(
-        default="ZAR", 
-        description="The currency of the sender initiating the payment. Standardised to 3-letter ISO. Defaults to ZAR"
+        default="DEFAULT", 
+        description="The currency of the sender initiating the payment. Standardised to 3-letter ISO. Defaults to a flag 'DEFAULT' if not explicitly given."
     )
     target_currency: str = Field(
-        default="ZAR",
-        description="The currency the receiver must get. Standardised to 3-letter ISO. Defaults to ZAR if implicit"
+        default="DEFAULT",
+        description="The currency the receiver must get. Standardised to 3-letter ISO. Defaults to a flag 'DEFAULT' if not explicitly given."
     )
     conversion_type: Literal["NONE", "FIXED_SEND", "FIXED_RECEIVE"] = Field(
         default="NONE",
@@ -63,7 +63,7 @@ Backend can always expect this layout in terms of a JSON
     - List of all transactions to be made
 """
 class PaymentIntent(BaseModel):
-    intent: Literal["PAYMENT", "PAYMENT_MULTIPLE", "BALANCE_CHECK", "CLARIFY"] = Field(
+    intent: Literal["PAYMENT", "PAYMENT_MULTIPLE", "BALANCE_CHECK", "GROUP_FUND", "CLARIFY"] = Field(
         description="The primary action the user wants to take."
     )
     
@@ -74,6 +74,7 @@ class PaymentIntent(BaseModel):
 
 """
 End-Point function to be called by backend 
+Boolean flag to handle group fund additions that are ambiguous
 """
 def parse_text(meta_data: dict, group_roster: List[str]) -> dict:
     client = genai.Client()
@@ -98,7 +99,7 @@ def parse_text(meta_data: dict, group_roster: List[str]) -> dict:
     
     Guidelines:
     1. The request may be written in local South African languages or slang (isiXhosa, Zulu, Afrikaans, English).
-    2. Default 'source_currency' to 'ZAR' unless explicitly stated otherwise.
+    2. Default 'source_currency' to a flag 'DEFAULT' if the currency is not explicit - e.g. bucks. This default allows the backend to use the wallet's actual currency type
     3. Determine 'conversion_type' accurately based on whether they fix the send or receive side currency values.
     4. Normalize all currencies to standard 3-letter ISO codes.
 
