@@ -27,6 +27,37 @@ interface PaymentSession {
 export const activeSessions = new Map<string, PaymentSession>();
 export const txToSessionMap = new Map<string, string>();
 
+// Resolve an AI-extracted recipient string to a registered user — group roster
+// (by display name) first, then global username / phone / display name. Shared by
+// the payment loop and the clarification fallback so both resolve identically.
+async function resolveRecipient(
+    recipientQuery: string | undefined,
+    isGroup: boolean,
+    groupTelegramId: string | undefined,
+) {
+    const query = recipientQuery?.trim();
+    if (!query) return null;
+
+    let matched: any = null;
+    if (isGroup && groupTelegramId) {
+        matched = await db.select({
+                id: users.id,
+                displayName: users.displayName,
+                walletAddress: users.walletAddress,
+            })
+            .from(users)
+            .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
+            .where(and(
+                eq(groupMembers.groupTelegramId, groupTelegramId),
+                eq(users.displayName, query),
+            )).get();
+    }
+    if (!matched) matched = await db.select().from(users).where(eq(users.telegramUsername, query)).get();
+    if (!matched) matched = await db.select().from(users).where(eq(users.phoneNumber, query)).get();
+    if (!matched) matched = await db.select().from(users).where(eq(users.displayName, query)).get();
+    return matched ?? null;
+}
+
 // 1. POST /bot/checkUser
 router.post('/checkUser', async (req, res) => {
     const { telegramUserId } = req.body;
@@ -141,13 +172,15 @@ router.post('/processPlainText', async (req, res) => {
             }
 
             case 'CLARIFY': {
+                // Top-level CLARIFY = the AI couldn't tell what the user wants at
+                // all → the "intent" pathway (vs. a known payment missing a field).
                 return res.json({
                     status: 'needs_clarification',
                     sessionId,
                     clarifications: [
                         {
-                            field: 'recipient',
-                            question: '🤔 I could not quite read that. Who would you like to pay, and how much?',
+                            field: 'intent',
+                            question: "🤔 I'm not sure what you meant. What would you like to do?",
                             suggestions: []
                         }
                     ]
@@ -218,10 +251,85 @@ router.post('/processPlainText', async (req, res) => {
                 }
 
                 if (sessionQueue.length === 0) {
+                    // Classify WHY nothing resolved so the bot asks the right thing:
+                    // recipient known but amount missing → "amount"; else → "recipient".
+                    const tx0 = extractedTransactions[0] || {};
+                    const recipientQuery = tx0.recipients?.[0]?.trim();
+                    const amount = tx0.amount;
+                    const currency = tx0.target_currency || 'ZAR';
+                    const matched = await resolveRecipient(recipientQuery, isGroup, groupTelegramId);
+
+                    if (matched?.walletAddress && (!amount || amount <= 0)) {
+                        return res.json({
+                            status: 'needs_clarification',
+                            sessionId,
+                            payment: { recipientDisplay: matched.displayName, recipientWallet: matched.walletAddress },
+                            clarifications: [{
+                                field: 'amount',
+                                question: `💸 How much should I send to ${matched.displayName}? (numbers only, e.g. 50)`,
+                                suggestions: [],
+                            }],
+                        });
+                    }
+
                     return res.json({
-                        status: 'error',
-                        reason: 'Could not resolve any registered recipients in the system.'
+                        status: 'needs_clarification',
+                        sessionId,
+                        payment: (amount && amount > 0) ? { amountDisplay: amount.toFixed(2), currency } : undefined,
+                        clarifications: [{
+                            field: 'recipient',
+                            question: (amount && amount > 0)
+                                ? `👤 Who should I send ${amount.toFixed(2)} ${currency} to? Send their @username, phone, or wallet.`
+                                : `👤 Who would you like to pay? Send their @username, phone, or wallet.`,
+                            suggestions: groupRoster,
+                        }],
                     });
+                }
+
+                // ── Currency clarification ───────────────────────────────────
+                // If the requested currency matches NEITHER wallet (and the two
+                // wallets differ), we can't pick which side to fix — ask the user
+                // to choose between the sender's and the recipient's currency.
+                const checkTx = sessionQueue[0];
+                const senderRow = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+                if (senderRow?.walletAddress) {
+                    try {
+                        const opClient = await getClient();
+                        const [senderWallet, recipientWallet] = await Promise.all([
+                            opClient.walletAddress.get({ url: normalizeWalletAddress(senderRow.walletAddress) }),
+                            opClient.walletAddress.get({ url: normalizeWalletAddress(checkTx.recipientWallet) }),
+                        ]);
+                        const requested = (checkTx.currency || '').toUpperCase();
+                        const senderCur = senderWallet.assetCode;
+                        const recipientCur = recipientWallet.assetCode;
+
+                        // Clarify whenever the requested currency matches NEITHER
+                        // wallet — even if both wallets share the same currency.
+                        if (requested && requested !== senderCur && requested !== recipientCur) {
+                            const sameCur = senderCur === recipientCur;
+                            return res.json({
+                                status: 'needs_clarification',
+                                sessionId,
+                                payment: {
+                                    amountDisplay: checkTx.amount.toFixed(2),
+                                    recipientDisplay: checkTx.recipientName,
+                                    recipientWallet: checkTx.recipientWallet,
+                                },
+                                clarifications: [{
+                                    field: 'currency',
+                                    // suggestions[0] = sender's currency, suggestions[1] = recipient's.
+                                    // Collapses to a single entry when both wallets share a currency.
+                                    question: sameCur
+                                        ? `⚠️ You asked to pay in ${requested}, but both wallets use ${senderCur}. Pay in ${senderCur} instead?`
+                                        : `⚠️ You asked to pay in ${requested}, but your wallet sends ${senderCur} and theirs receives ${recipientCur}. Which currency should I use?`,
+                                    suggestions: sameCur ? [senderCur] : [senderCur, recipientCur],
+                                }],
+                            });
+                        }
+                    } catch (e) {
+                        console.error('currency check failed (continuing):', e);
+                        // Fail open — let the normal quote flow surface any currency issue.
+                    }
                 }
 
                 activeSessions.set(sessionId, {
