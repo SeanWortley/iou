@@ -28,11 +28,12 @@ Defines the layout of an individual transaction for genAI
 """
 class TransactionDetail(BaseModel):
     recipients: List[str] = Field(
-        default=[],
+        default="CLARIFY",
         description=(
             "List of identifiers for the receivers (handles, wallet addresses, phone numbers, or IDs). "
             "If a plain name is used, prioritize matching it to an identifier in the provided roster context."
             "If in a group context, it is implied that all members must be paid or receive money, use all members of group roster except the sender"
+            "If the recipient is not known or not clear, default to 'CLARIFY' on the recipient."
         )
     )
     amount: Optional[float] = Field(
@@ -102,6 +103,9 @@ def parse_text(meta_data: dict, group_roster: List[str]) -> dict:
     2. Default 'source_currency' to a flag 'DEFAULT' if the currency is not explicit - e.g. bucks. This default allows the backend to use the wallet's actual currency type
     3. Determine 'conversion_type' accurately based on whether they fix the send or receive side currency values.
     4. Normalize all currencies to standard 3-letter ISO codes.
+
+    Additional Guidelines:
+    1. If the intent is known, such as PAYMENT etc. but does not know the recipient 
 
     ENVIRONMENT CONTEXT:
     - [SENDER_IDENTIFIER]: "{sender}"
