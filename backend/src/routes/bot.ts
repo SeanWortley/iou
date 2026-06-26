@@ -177,6 +177,52 @@ router.post('/processPlainText', async (req, res) => {
                     });
                 }
 
+                // ── Currency clarification ───────────────────────────────────
+                // If the requested currency matches NEITHER wallet (and the two
+                // wallets differ), we can't pick which side to fix — ask the user
+                // to choose between the sender's and the recipient's currency.
+                const checkTx = sessionQueue[0];
+                const senderRow = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+                if (senderRow?.walletAddress) {
+                    try {
+                        const opClient = await getClient();
+                        const [senderWallet, recipientWallet] = await Promise.all([
+                            opClient.walletAddress.get({ url: normalizeWalletAddress(senderRow.walletAddress) }),
+                            opClient.walletAddress.get({ url: normalizeWalletAddress(checkTx.recipientWallet) }),
+                        ]);
+                        const requested = (checkTx.currency || '').toUpperCase();
+                        const senderCur = senderWallet.assetCode;
+                        const recipientCur = recipientWallet.assetCode;
+
+                        // Clarify whenever the requested currency matches NEITHER
+                        // wallet — even if both wallets share the same currency.
+                        if (requested && requested !== senderCur && requested !== recipientCur) {
+                            const sameCur = senderCur === recipientCur;
+                            return res.json({
+                                status: 'needs_clarification',
+                                sessionId,
+                                payment: {
+                                    amountDisplay: checkTx.amount.toFixed(2),
+                                    recipientDisplay: checkTx.recipientName,
+                                    recipientWallet: checkTx.recipientWallet,
+                                },
+                                clarifications: [{
+                                    field: 'currency',
+                                    // suggestions[0] = sender's currency, suggestions[1] = recipient's.
+                                    // Collapses to a single entry when both wallets share a currency.
+                                    question: sameCur
+                                        ? `⚠️ You asked to pay in ${requested}, but both wallets use ${senderCur}. Pay in ${senderCur} instead?`
+                                        : `⚠️ You asked to pay in ${requested}, but your wallet sends ${senderCur} and theirs receives ${recipientCur}. Which currency should I use?`,
+                                    suggestions: sameCur ? [senderCur] : [senderCur, recipientCur],
+                                }],
+                            });
+                        }
+                    } catch (e) {
+                        console.error('currency check failed (continuing):', e);
+                        // Fail open — let the normal quote flow surface any currency issue.
+                    }
+                }
+
                 activeSessions.set(sessionId, {
                     transactions: sessionQueue,
                     currentIndex: 0,

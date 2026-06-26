@@ -210,6 +210,30 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
     state.clarifications = result.clarifications;
     state.step = "awaiting_clarification";
     const next = result.clarifications[0];
+
+    // Currency mismatch: the stated currency matches neither wallet. Offer the two
+    // wallet currencies as inline buttons — sender's currency → fixed-send, the
+    // recipient's → fixed-receive. Stash wallet + amount so the tap can rebuild.
+    if (next?.field === "currency" && result.payment?.recipientWallet) {
+      const sugg = next.suggestions ?? [];
+      state.recipientType = "wallet";
+      state.manualRecipient = result.payment.recipientWallet;
+      state.manualAmount = result.payment.amountDisplay;
+      // One option when both wallets share a currency, two when they differ.
+      const rows =
+        sugg.length === 1
+          ? [[{ text: `✅ Pay in ${sugg[0]}`, callback_data: "currency_send" }]]
+          : [
+              [{ text: `💸 Send in ${sugg[0]}`, callback_data: "currency_send" }],
+              [{ text: `🎯 They receive ${sugg[1]}`, callback_data: "currency_receive" }],
+            ];
+      rows.push([{ text: "❌ Cancel", callback_data: "cancel_payment" }]);
+      await send(next.question ?? "Which currency should I use?", {
+        reply_markup: { inline_keyboard: rows },
+      });
+      return;
+    }
+
     const reply_markup = next?.suggestions?.length
       ? { keyboard: next.suggestions.map((s) => [{ text: s }]), resize_keyboard: true, one_time_keyboard: true }
       : { force_reply: true };
@@ -569,6 +593,10 @@ export async function handleBotMessage(ctx: any): Promise<void> {
     // ── Payment (shared tail) ───────────────────────────────────────────────
     case "awaiting_clarification": {
       const field = state.clarifications?.[0]?.field ?? "unknown";
+      if (field === "currency") {
+        await ctx.reply("Please tap one of the currency buttons above.");
+        return;
+      }
       let result: ParseResult;
       try {
         result = await clarifyPayment({
@@ -644,6 +672,32 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
     state.step = "idle";
     await ctx.answerCallbackQuery("Cancelled");
     await ctx.reply("Payment cancelled. Send a new instruction whenever you're ready.");
+    return;
+  }
+
+  // Currency clarification choice → fixed-send (sender's currency) or
+  // fixed-receive (recipient's). buildPayment derives the currency from the type.
+  if (callbackData === "currency_send" || callbackData === "currency_receive") {
+    if (state.step !== "awaiting_clarification" || !state.manualRecipient || !state.manualAmount) {
+      await ctx.answerCallbackQuery("Start again with /pay.");
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    const paymentType = callbackData === "currency_send" ? "FIXED_SEND" : "FIXED_RECEIVE";
+    let result: ParseResult;
+    try {
+      result = await buildPayment({
+        telegramUserId: userId,
+        recipient: { type: "wallet", value: state.manualRecipient },
+        amount: state.manualAmount,
+        paymentType,
+      });
+    } catch (error) {
+      console.error("buildPayment (currency) failed", error);
+      await ctx.reply("Couldn't build the payment. Please try again.");
+      return;
+    }
+    await renderParseResult(state, replySend(ctx), result);
     return;
   }
 
