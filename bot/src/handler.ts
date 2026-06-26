@@ -214,17 +214,26 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
     delete state.manualRecipient;
     delete state.manualAmount;
 
-    // Intent: the AI couldn't tell what the user wants → offer actions as buttons.
+    // Intent: the AI couldn't tell what the user wants → don't keep guessing,
+    // drop them straight into the explicit step-by-step pay path (+ Cancel).
     if (next?.field === "intent") {
-      await send(next?.question ?? "What would you like to do?", {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "💸 Make a payment", callback_data: "clarify_pay" }],
-            [{ text: "💰 Check balance", callback_data: "clarify_balance" }],
-            [{ text: "✖️ Never mind", callback_data: "cancel_payment" }],
-          ],
+      state.step = "awaiting_manual_recipient_type";
+      await send(
+        (next?.question ? `${next.question}\n\n` : "") +
+          "Let's do it step by step. 👤 Who are you paying? Choose how to identify them:",
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "📱 Phone", callback_data: "recip_phone" },
+                { text: "💬 Username", callback_data: "recip_username" },
+                { text: "🏦 Wallet", callback_data: "recip_wallet" },
+              ],
+              [{ text: "❌ Cancel payment", callback_data: "cancel_payment" }],
+            ],
+          },
         },
-      });
+      );
       return;
     }
 
@@ -748,22 +757,6 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
     state.step = "idle";
     await ctx.answerCallbackQuery("Cancelled");
     await ctx.reply("Payment cancelled. Send a new instruction whenever you're ready.");
-    return;
-  }
-
-  // Intent clarification: route the chosen action.
-  if (callbackData === "clarify_pay") {
-    clearPaymentSession(state);
-    state.step = "idle";
-    await ctx.answerCallbackQuery();
-    await ctx.reply('Tell me what you\'d like to pay — e.g. "pay 50 to @alice".', {
-      reply_markup: { force_reply: true },
-    });
-    return;
-  }
-  if (callbackData === "clarify_balance") {
-    await ctx.answerCallbackQuery();
-    await ctx.reply("💰 Balance checking isn't available yet — coming soon!");
     return;
   }
 
