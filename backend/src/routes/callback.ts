@@ -71,7 +71,9 @@ callbackRouter.get('/', async (req, res) => {
             throw new Error('Grant continuation did not return an access token.');
         }
 
-        const sendingWallet = await client.walletAddress.get({ url: tx.senderWalletAddress });
+        const sendingWallet = await client.walletAddress.get({
+            url: normalizeWalletAddress(tx.senderWalletAddress)
+        });
 
         const outgoingPayment = await client.outgoingPayment.create(
             {
@@ -132,6 +134,15 @@ callbackRouter.get('/', async (req, res) => {
         res.send(page(`Payment failed: ${message}`, false));
     }
 });
+
+function normalizeWalletAddress(url: string): string {
+    const trimmed = url.trim();
+    if (trimmed.startsWith('$')) {
+        return 'https://' + trimmed.substring(1);
+    }
+    return trimmed;
+}
+
 
 function page(message: string, success: boolean): string {
     const colour = success ? '#22c55e' : '#ef4444';
