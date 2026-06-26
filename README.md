@@ -228,8 +228,14 @@ await client.outgoingPayment.create({ url: sendingWallet.resourceServer, accessT
 | Command           | Description                                               |
 | ----------------- | --------------------------------------------------------- |
 | `npm run dev`     | Start backend (:3001) + frontend (:5173)                  |
+| `npm run dev:all` | Start db push + backend + bot + AI server (:8000)         |
+| `npm run ai`      | Start the FastAPI NL parser (:8000) on its own            |
+| `npm run bot`     | Start the Telegram bot on its own                         |
 | `npm run build`   | Build both packages                                       |
 | `npm run db:push` | Push schema changes to SQLite (no migration files needed) |
+
+> `dev:all` runs the AI server via `python -m uvicorn`. First time, install its
+> deps: `pip install -r backend/src/Interpreter/requirements.txt`.
 
 ---
 
