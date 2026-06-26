@@ -18,8 +18,12 @@ import {
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversation state machine
 //
-// Registration:   awaiting_contact → awaiting_wallet_address → awaiting_wallet_key
-//                 → awaiting_password_setup → idle   (always happens in a DM)
+// Registration:   awaiting_contact → awaiting_wallet_address → idle
+//                 (always happens in a DM)
+//
+// Payments are executed by a custodial client wallet on the user's behalf, so
+// we never collect a private key or a payment password — registration just ties
+// a Telegram user to their wallet address.
 //
 // Groups ("money groups"):
 //   • bot added → posts a welcome telling people to /join
@@ -27,19 +31,17 @@ import {
 //                 deep-link button that opens a DM and runs /start (carrying the
 //                 group id, so they're enrolled once setup finishes).
 //   • /iou … in a group is a TRIGGER: the bot resolves the sender, parses with
-//     group context, then bounces the whole confirm → password → approve tail
-//     into the sender's DM. On success it announces the payment back in the group.
+//     group context, then bounces the whole confirm → approve tail into the
+//     sender's DM. On success it announces the payment back in the group.
 //
 // Payment tail (DM): ParseResult ──(clarify loop)──► awaiting_confirmation
-//   ──Confirm──► confirmPayment → awaiting_payment_password ──password──►
-//   authorizePayment → awaiting_approval ──"I've approved"──► finalizePayment → idle
+//   ──Confirm──► confirmPayment → authorizePayment → awaiting_approval
+//   ──"I've approved"──► finalizePayment → idle
 // ─────────────────────────────────────────────────────────────────────────────
 
 type UserStep =
   | "awaiting_contact"
   | "awaiting_wallet_address"
-  | "awaiting_wallet_key"
-  | "awaiting_password_setup"
   | "idle"
   | "awaiting_manual_recipient_type"
   | "awaiting_manual_recipient"
@@ -47,7 +49,6 @@ type UserStep =
   | "awaiting_manual_paytype"
   | "awaiting_clarification"
   | "awaiting_confirmation"
-  | "awaiting_payment_password"
   | "awaiting_approval";
 
 type UserState = {
@@ -55,7 +56,6 @@ type UserState = {
   // registration
   contact?: string;
   walletAddress?: string;
-  walletKey?: string;
   pendingGroupId?: string; // enrol in this group once registration finishes
   // manual payment builder
   recipientType?: RecipientType;
@@ -81,12 +81,7 @@ function getState(userId: number): UserState {
 }
 
 function isRegistrationStep(step: UserStep): boolean {
-  return (
-    step === "awaiting_contact" ||
-    step === "awaiting_wallet_address" ||
-    step === "awaiting_wallet_key" ||
-    step === "awaiting_password_setup"
-  );
+  return step === "awaiting_contact" || step === "awaiting_wallet_address";
 }
 
 function clearPaymentSession(state: UserState): void {
@@ -449,29 +444,15 @@ export async function handleBotMessage(ctx: any): Promise<void> {
 
     case "awaiting_wallet_address": {
       state.walletAddress = text;
-      state.step = "awaiting_wallet_key";
-      await ctx.reply("🔑 Paste your private wallet key:", { reply_markup: { force_reply: true } });
-      return;
-    }
 
-    case "awaiting_wallet_key": {
-      state.walletKey = text;
-      state.step = "awaiting_password_setup";
-      await ctx.reply("🔐 Create a password to secure your key (you'll enter it for each payment):", {
-        reply_markup: { force_reply: true },
-      });
-      return;
-    }
-
-    case "awaiting_password_setup": {
+      // The wallet address is the last thing we need — payments are run by the
+      // custodial client wallet, so there's no key or password to collect.
       try {
         await processRegistration({
           telegramUserId: userId,
           telegramUsername: ctx.from?.username,
           phoneNumber: state.contact ?? "",
           walletAddress: state.walletAddress ?? "",
-          privateKey: state.walletKey ?? "",
-          password: text,
         });
       } catch (error) {
         console.error("processRegistration failed", error);
@@ -479,7 +460,6 @@ export async function handleBotMessage(ctx: any): Promise<void> {
         userState.delete(userId);
         return;
       }
-      delete state.walletKey; // don't keep the key in memory after registration
 
       // If they arrived via a group deep link, enrol them in that group now.
       let joinedGroup = false;
@@ -558,40 +538,6 @@ export async function handleBotMessage(ctx: any): Promise<void> {
         return;
       }
       await renderParseResult(state, replySend(ctx), result);
-      return;
-    }
-
-    case "awaiting_payment_password": {
-      // Best-effort: remove the message so the password doesn't linger in the chat
-      ctx.deleteMessage?.().catch(() => {});
-
-      let auth: { interactUrl: string; transactionId: string };
-      try {
-        auth = await authorizePayment({
-          telegramUserId: userId,
-          sessionId: state.sessionId ?? "",
-          password: text,
-        });
-      } catch (error) {
-        console.error("authorizePayment failed", error);
-        state.step = "awaiting_confirmation";
-        await ctx.reply("Authorization failed (wrong password, or the payment couldn't start). Confirm again to retry.", {
-          reply_markup: confirmKeyboard,
-        });
-        return;
-      }
-
-      state.transactionId = auth.transactionId;
-      state.step = "awaiting_approval";
-      await ctx.reply("Almost there — approve the payment in your wallet, then tap the button below.", {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "🔐 Approve in wallet", url: auth.interactUrl }],
-            [{ text: "✅ I've approved", callback_data: "approved_payment" }],
-            [{ text: "❌ Cancel", callback_data: "cancel_payment" }],
-          ],
-        },
-      });
       return;
     }
 
@@ -733,10 +679,33 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
       await ctx.reply("Couldn't confirm the payment. Please try again.");
       return;
     }
-    state.step = "awaiting_payment_password";
+
+    // No password needed — the custodial client wallet authorizes the payment and
+    // hands back the wallet approval link for the sender to grant.
+    let auth: { interactUrl: string; transactionId: string };
+    try {
+      auth = await authorizePayment({ telegramUserId: userId, sessionId: state.sessionId });
+    } catch (error) {
+      console.error("authorizePayment failed", error);
+      state.step = "awaiting_confirmation";
+      await ctx.answerCallbackQuery("Failed");
+      await ctx.reply("Couldn't start the payment. Confirm again to retry.", {
+        reply_markup: confirmKeyboard,
+      });
+      return;
+    }
+
+    state.transactionId = auth.transactionId;
+    state.step = "awaiting_approval";
     await ctx.answerCallbackQuery("Confirmed");
-    await ctx.reply("🔐 Enter your password to authorize the payment:", {
-      reply_markup: { force_reply: true },
+    await ctx.reply("Almost there — approve the payment in your wallet, then tap the button below.", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔐 Approve in wallet", url: auth.interactUrl }],
+          [{ text: "✅ I've approved", callback_data: "approved_payment" }],
+          [{ text: "❌ Cancel", callback_data: "cancel_payment" }],
+        ],
+      },
     });
     return;
   }
