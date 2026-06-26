@@ -230,8 +230,12 @@ router.post('/authorizePayment', async (req, res) => {
         const client = await getClient();
 
         // Resolve wallets
-        const senderWallet = await client.walletAddress.get({ url: sender.walletAddress });
-        const receiverWallet = await client.walletAddress.get({ url: session.recipientWallet });
+        const senderWallet = await client.walletAddress.get({
+            url: normalizeWalletAddress(sender.walletAddress)
+        });
+        const receiverWallet = await client.walletAddress.get({
+            url: normalizeWalletAddress(session.recipientWallet) // Wrapped here! [1]
+        });
 
         // Request incoming-payment grant
         const incomingGrant = await client.grant.request(
@@ -380,7 +384,9 @@ router.post('/buildPayment', async (req, res) => {
             }
         }
 
-        const receiverWallet = await client.walletAddress.get({ url: recipientWallet });
+        const receiverWallet = await client.walletAddress.get({
+            url: normalizeWalletAddress(recipientWallet)
+        });
         const currency = receiverWallet.assetCode; // e.g. "USD" or "ZAR"
 
         const sessionId = crypto.randomUUID();
@@ -465,5 +471,14 @@ router.post('/finalizePayment', async (req, res) => {
         return res.json({ status: 'FAILED', detail: error.message || 'Verification failed.' });
     }
 });
+
+// Helper to safely convert payment pointers ($ilp...) to standard https:// URLs [1]
+function normalizeWalletAddress(url: string): string {
+    const trimmed = url.trim();
+    if (trimmed.startsWith('$')) {
+        return 'https://' + trimmed.substring(1);
+    }
+    return trimmed;
+}
 
 export default router;
