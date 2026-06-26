@@ -40,18 +40,18 @@ class TransactionDetail(BaseModel):
     )
     source_currency: str = Field(
         default="DEFAULT", 
-        description="The currency of the sender initiating the payment. Standardised to 3-letter ISO. Defaults to a flag 'DEFAULT' if not explicitly given."
+        description="The currency of the sender. STRICT RULE: Set to 'DEFAULT' if the currency is not explicitly and clearly specified (e.g., if they just say '50', '50 bucks', '50 moolah'). Only use standard 3-letter ISO (like ZAR, USD) if the currency name itself is explicitly stated."
     )
     target_currency: str = Field(
         default="DEFAULT",
-        description="The currency the receiver must get. Standardised to 3-letter ISO. Defaults to a flag 'DEFAULT' if not explicitly given."
+        description="The currency the receiver must get. STRICT RULE: Set to 'DEFAULT' if the currency is not explicitly and clearly specified. Only use standard 3-letter ISO (like ZAR, USD) if the currency name itself is explicitly stated."
     )
     conversion_type: Literal["NONE", "FIXED_SEND", "FIXED_RECEIVE"] = Field(
         default="NONE",
         description=(
-            "Set to FIXED_SEND if the user specifies a fixed amount in their local currency to convert from"
-            "Set to FIXED_RECEIVE if the user explicitly wants the recipient to get a exact fixed amount in a foreign currency"
-            "Set to NONE if both currencies are identical"
+            "Set to FIXED_SEND if the user specifies a fixed amount in their local currency to convert from. "
+            "Set to FIXED_RECEIVE if the user explicitly wants the recipient to get an exact fixed amount in a foreign currency. "
+            "Set to NONE if both currencies are identical or both default to 'DEFAULT'."
         )
     )
 
