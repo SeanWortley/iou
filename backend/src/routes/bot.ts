@@ -101,7 +101,7 @@ router.post('/processPlainText', async (req, res) => {
 
                 return res.json({
                     status: 'error',
-                    reason: `ℹ️ Balance Check:\n\nYour current wallet balance is approximately <b>1,500.00 ${currency}</b>.`
+                    reason: `Balance needs to be implement`
                 });
             }
 
