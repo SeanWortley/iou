@@ -246,11 +246,19 @@ export async function handleChatMemberUpdate(ctx: any): Promise<void> {
     (oldStatus === "left" || oldStatus === "kicked" || !oldStatus);
 
   if (joined && (chatType === "group" || chatType === "supergroup")) {
+    const groupId = String(ctx.chat.id);
     await ctx.reply(
       "Hi, I'm the IOU Bot 👋\n\n" +
         "I let this group send money to each other.\n" +
-        "• Type /join to join the money group — I'll set up your wallet in a private chat.\n" +
-        "• Then pay anyone here with:  /iou pay @alice 50"
+        "Tap below to join this group's money pool, or set up a new account first.",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "💰 Join money group", callback_data: "join_money_group" }],
+            [{ text: "✨ Sign me up", url: deepLink(groupId) }],
+          ],
+        },
+      }
     );
   }
 }
@@ -603,6 +611,31 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
   const callbackData = ctx.callbackQuery?.data as string | undefined;
   const userId = ctx.from?.id as number | undefined;
   if (!callbackData || !userId) return;
+
+  if (callbackData === "join_money_group") {
+    const groupId = String(ctx.chat?.id ?? "");
+    if (!groupId) {
+      await ctx.answerCallbackQuery("Couldn't identify the group. Please try again.");
+      return;
+    }
+    if (!(await isRegistered(userId))) {
+      await ctx.answerCallbackQuery("You need to register first!");
+      await ctx.reply(
+        `${mention(ctx.from)}, you need to set up an account before joining the money group. Tap below to get started.`,
+        { reply_markup: { inline_keyboard: [[{ text: "✨ Sign me up", url: deepLink(groupId) }]] } }
+      );
+      return;
+    }
+    try {
+      await joinGroup({ telegramUserId: userId, telegramUsername: ctx.from?.username, groupTelegramId: groupId });
+      await ctx.answerCallbackQuery("You're in!");
+      await ctx.reply(`✅ ${mention(ctx.from)} joined the money group!`);
+    } catch (error) {
+      console.error("joinGroup failed", error);
+      await ctx.answerCallbackQuery("Couldn't add you right now — please try again.");
+    }
+    return;
+  }
 
   const state = userState.get(userId);
   if (!state) {
