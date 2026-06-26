@@ -1,100 +1,243 @@
 import { Router } from 'express';
 import { db } from '../db';
-import {users, transactions, groupMembers} from '../db/schema';
-import { eq, and } from 'drizzle-orm';
+import { users, groupMembers, transactions } from '../db/schema';
+import { and, eq } from 'drizzle-orm';
 import { getClient } from '../lib/openPayments';
-import { randomUUID } from 'crypto';
-import {isPendingGrant} from "@interledger/open-payments";
-import axios from "axios";
+import { isPendingGrant } from '@interledger/open-payments';
+import axios from 'axios';
+import crypto from 'crypto';
 
 const router = Router();
 
-/**
- * 1. CHECK USER STATUS
- *
- */
-router.post('/check-user', async (req, res) => {
-    const { telegramId, phoneNumber } = req.body;
+// IN-MEMORY SESSION STORE: Remembers payment details between parsing and authorizing [1]
+interface PaymentSession {
+    amount: number;
+    currency: string;
+    recipientWallet: string;
+}
+const activeSessions = new Map<string, PaymentSession>();
+
+// 1. POST /bot/checkUser
+router.post('/checkUser', async (req, res) => {
+    const { telegramUserId } = req.body;
     try {
-        let user = null;
-        if (telegramId) {
-            user = await db.select().from(users).where(eq(users.telegramId, telegramId)).get();
-        } else if (phoneNumber) {
-            user = await db.select().from(users).where(eq(users.phoneNumber, phoneNumber)).get();
-        }
-        return res.json({ registered: !!user, user });
+        const user = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        return res.json({ registered: !!user });
     } catch (error) {
-        return res.status(500).json({ error: 'Database check failed' });
+        console.error('checkUser failed:', error);
+        return res.status(500).json({ error: 'Database query failed' });
     }
 });
 
-/**
- * 2. INITIATE PAYMENT
- * This is where we run the Open Payments flow, generate a quote,
- * and get the Interactive Grant redirection URL.
- */
-router.post('/initiate-payment', async (req, res) => {
-    const { senderTelegramId, recipientPhoneNumber, amount, currency } = req.body;
+// 2. POST /bot/processRegistration
+router.post('/processRegistration', async (req, res) => {
+    const { telegramUserId, telegramUsername, phoneNumber, walletAddress, privateKey, password } = req.body;
 
     try {
-        const sender = await db.select().from(users).where(eq(users.telegramId, senderTelegramId.toString())).get();
-        const receiver = await db.select().from(users).where(eq(users.phoneNumber, recipientPhoneNumber)).get();
+        const salt = crypto.randomBytes(16).toString('base64');
+        const iv = crypto.randomBytes(12).toString('base64');
 
-        if (!sender || !sender.walletAddress) {
-            return res.status(400).json({ error: "Sender profile or wallet is not registered." });
+        const key = crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256');
+
+        const cipher = crypto.createCipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
+        let encrypted = cipher.update(privateKey, 'utf8', 'base64');
+        encrypted += cipher.final('base64');
+        const authTag = cipher.getAuthTag().toString('base64');
+
+        const displayName = telegramUsername ? `@${telegramUsername}` : 'User';
+
+        await db.insert(users).values({
+            id: crypto.randomUUID(),
+            telegramId: telegramUserId.toString(),
+            telegramUsername: telegramUsername ? `@${telegramUsername}` : null,
+            displayName,
+            phoneNumber,
+            passwordHash: crypto.createHash('sha256').update(password).digest('hex'),
+            walletAddress,
+            privateKeyEncrypted: encrypted,
+            privateKeyIv: iv,
+            privateKeySalt: salt,
+            createdAt: new Date(),
+        });
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error('Registration failed:', error);
+        return res.status(500).json({ error: 'Failed to complete registration' });
+    }
+});
+
+// 3. POST /bot/processPlainText
+router.post('/processPlainText', async (req, res) => {
+    const { telegramUserId, text, context } = req.body;
+
+    try {
+        const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
+        const aiResponse = await axios.post(aiServerUrl, { text });
+        const intentData = aiResponse.data;
+
+        const sessionId = crypto.randomUUID();
+
+        if (intentData.intent !== 'PAYMENT') {
+            return res.json({ status: 'error', reason: 'Only payment instructions are supported right now.' });
         }
-        if (!receiver || !receiver.walletAddress) {
-            return res.status(400).json({ error: "Receiver profile or wallet is not registered." });
+
+        const recipientQuery = intentData.recipient?.trim();
+        if (!recipientQuery) {
+            return res.json({ status: 'error', reason: 'Could not detect who you want to pay.' });
+        }
+
+        let matchedUser = null;
+        const isGroup = context?.chatType === 'group' || context?.chatType === 'supergroup';
+        const groupTelegramId = context?.chatId?.toString();
+
+        if (isGroup && groupTelegramId) {
+            matchedUser = await db.select({
+                id: users.id,
+                displayName: users.displayName,
+                walletAddress: users.walletAddress
+            })
+                .from(users)
+                .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
+                .where(and(
+                    eq(groupMembers.groupTelegramId, groupTelegramId),
+                    eq(users.displayName, recipientQuery)
+                )).get();
+        }
+
+        if (!matchedUser) {
+            matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
+            if (!matchedUser) {
+                matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipientQuery)).get();
+            }
+        }
+
+        if (!matchedUser || !matchedUser.walletAddress) {
+            return res.json({
+                status: 'error',
+                reason: `Could not find a registered user named "${recipientQuery}" in our system.`
+            });
+        }
+
+        // SAVE PAYMENT TO SESSION MAP [1]
+        activeSessions.set(sessionId, {
+            amount: intentData.amount,
+            currency: intentData.currency || 'USD',
+            recipientWallet: matchedUser.walletAddress
+        });
+
+        return res.json({
+            status: 'ok',
+            sessionId,
+            payment: {
+                amountDisplay: intentData.amount.toString(),
+                currency: intentData.currency || 'USD',
+                recipientDisplay: matchedUser.displayName,
+                recipientWallet: matchedUser.walletAddress,
+                note: intentData.note || undefined
+            }
+        });
+
+    } catch (error) {
+        console.error('processPlainText failed:', error);
+        return res.json({ status: 'error', reason: 'Internal parsing server error.' });
+    }
+});
+
+// 4. POST /bot/joinGroup
+router.post('/joinGroup', async (req, res) => {
+    const { telegramUserId, telegramUsername, groupTelegramId } = req.body;
+
+    try {
+        const user = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        if (!user) {
+            return res.status(404).json({ error: 'User not registered.' });
+        }
+
+        const existing = await db.select().from(groupMembers)
+            .where(and(
+                eq(groupMembers.groupTelegramId, groupTelegramId.toString()),
+                eq(groupMembers.userId, user.id)
+            )).get();
+
+        if (!existing) {
+            await db.insert(groupMembers).values({
+                id: crypto.randomUUID(),
+                groupTelegramId: groupTelegramId.toString(),
+                userId: user.id,
+                lastSeenAt: new Date()
+            });
+        }
+
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error('joinGroup failed:', error);
+        return res.status(500).json({ error: 'Failed to join group roster' });
+    }
+});
+
+// 5. POST /bot/authorizePayment (REAL LEDGER TRANSACTION FLOW) [1]
+router.post('/authorizePayment', async (req, res) => {
+    const { telegramUserId, sessionId, password } = req.body;
+
+    try {
+        const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        if (!sender || !sender.walletAddress) {
+            return res.status(404).json({ error: 'Sender not registered.' });
+        }
+
+        // Verify Password
+        const derivedHash = crypto.createHash('sha256').update(password).digest('hex');
+        if (derivedHash !== sender.passwordHash) {
+            return res.status(401).json({ error: 'Invalid password' });
+        }
+
+        // Retrieve active session details [1]
+        const session = activeSessions.get(sessionId);
+        if (!session) {
+            return res.status(400).json({ error: 'Session expired or invalid.' });
         }
 
         const client = await getClient();
 
+        // Resolve wallets
         const senderWallet = await client.walletAddress.get({ url: sender.walletAddress });
-        const receiverWallet = await client.walletAddress.get({ url: receiver.walletAddress });
+        const receiverWallet = await client.walletAddress.get({ url: session.recipientWallet });
 
+        // Request incoming-payment grant
         const incomingGrant = await client.grant.request(
             { url: receiverWallet.authServer },
             { access_token: { access: [{ type: 'incoming-payment', actions: ['create', 'read'] }] } }
         );
 
-        if (isPendingGrant(incomingGrant)) {
+        if (isPendingGrant(incomingGrant) || !incomingGrant.access_token) {
             throw new Error('Expected non-interactive incoming payment grant');
         }
 
-        if (!incomingGrant.access_token) {
-            throw new Error('Access token is missing from incoming payment grant');
-        }
-
+        // Calculate scale dynamically
         const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
-        const amountInScale = Math.round(amount * scaleMultiplier).toString();
+        const amountInScale = Math.round(session.amount * scaleMultiplier).toString();
 
+        // Create incoming payment
         const incomingPayment = await client.incomingPayment.create(
             { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
-
             {
                 walletAddress: receiverWallet.id,
-                incomingAmount: {
-                    value: amountInScale,
-                    assetCode: receiverWallet.assetCode,
-                    assetScale: receiverWallet.assetScale
-                }
+                incomingAmount: { value: amountInScale, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale }
             }
         );
 
-
+        // Request quote grant
         const quoteGrant = await client.grant.request(
             { url: senderWallet.authServer },
             { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
         );
 
-        if (isPendingGrant(quoteGrant)) {
+        if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
             throw new Error('Expected non-interactive quote grant');
         }
 
-        if (!quoteGrant.access_token) {
-            throw new Error('Access token is missing from quote grant');
-        }
-
+        // Create quote
         const quote = await client.quote.create(
             { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
             {
@@ -105,8 +248,10 @@ router.post('/initiate-payment', async (req, res) => {
             }
         );
 
-        const interactNonce = randomUUID();
-        const callbackUrl = `${process.env.BACKEND_URL}/api/callback`;
+        // Request interactive outgoing payment grant
+        const interactNonce = crypto.randomUUID();
+        const txId = crypto.randomUUID();
+        const callbackUrl = `${process.env.BACKEND_URL}/api/callback?transactionId=${txId}`;
 
         const outgoingGrant = await client.grant.request(
             { url: senderWallet.authServer },
@@ -127,7 +272,6 @@ router.post('/initiate-payment', async (req, res) => {
         );
 
         if ('interact' in outgoingGrant) {
-            const txId = randomUUID();
             const now = new Date();
 
             await db.insert(transactions).values({
@@ -152,113 +296,15 @@ router.post('/initiate-payment', async (req, res) => {
             });
 
             return res.json({
-                success: true,
                 interactUrl: outgoingGrant.interact.redirect,
-                txId
+                transactionId: txId
             });
         }
 
         throw new Error("Unable to retrieve interactive authorization URL");
     } catch (error: any) {
-        console.error('[bot-router] initiate-payment error:', error);
+        console.error('authorizePayment failed:', error);
         return res.status(500).json({ error: error.message || 'Payment initiation failed.' });
-    }
-});
-
-/**
- * 3. AI PARSER GLUE ROUTE
- * Receives the raw message from the bot, forwards it to the AI teammate's server,
- * parses the intent, resolves the recipient's wallet, and returns verified details.
- */
-router.post('/parse-message', async (req, res) => {
-    const { text, telegram_object } = req.body;
-
-    try {
-        // TODO: ADD VALID AI_SERVER_URL
-        const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
-
-        const aiResponse = await axios.post(aiServerUrl, {
-            text,
-            telegram_object
-        });
-
-        const intentData = aiResponse.data;
-
-        // Handle a Payment Intent
-        if (intentData.intent === 'PAYMENT' && intentData.recipient) {
-            const recipientQuery = intentData.recipient.trim();
-            const isGroup = telegram_object?.chat?.type === 'group' || telegram_object?.chat?.type === 'supergroup';
-            const groupTelegramId = telegram_object?.chat?.id?.toString();
-
-            let matchedUser = null;
-
-            // Search Strategy A: If in a Group Chat, search only inside that group's members
-            if (isGroup && groupTelegramId) {
-                const result = await db.select({
-                    id: users.id,
-                    displayName: users.displayName,
-                    phoneNumber: users.phoneNumber,
-                    walletAddress: users.walletAddress,
-                })
-                    .from(users)
-                    .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
-                    .where(and(
-                        eq(groupMembers.groupTelegramId, groupTelegramId),
-                        eq(users.displayName, recipientQuery)
-                    )).get();
-
-                if (result) matchedUser = result;
-            }
-
-            // Search Strategy B: If not found in group or is a 1-1 Private Chat, search globally
-            if (!matchedUser) {
-                if (recipientQuery.startsWith('@')) {
-                    // Match by @username
-                    matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
-                } else {
-                    // Match by Phone Number
-                    matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipientQuery)).get();
-                    if (!matchedUser) {
-                        // Fallback: Match by Display Name globally
-                        matchedUser = await db.select().from(users).where(eq(users.displayName, recipientQuery)).get();
-                    }
-                }
-            }
-
-            // Respond with the verified recipient's wallet pointer
-            if (matchedUser && matchedUser.walletAddress) {
-                return res.json({
-                    success: true,
-                    intent: 'PAYMENT',
-                    amount: intentData.amount,
-                    currency: intentData.currency || 'ZAR',
-                    recipient: {
-                        id: matchedUser.id,
-                        displayName: matchedUser.displayName,
-                        phoneNumber: matchedUser.phoneNumber,
-                        walletAddress: matchedUser.walletAddress
-                    }
-                });
-            } else {
-                // AI parsed the recipient, but they aren't registered in UCT BotPay yet
-                return res.json({
-                    success: false,
-                    intent: 'PAYMENT',
-                    error: `I parsed a payment intent, but I couldn't find a registered BotPay user named "${recipientQuery}".`
-                });
-            }
-        }
-
-        // Handle non-payment intents (e.g., BALANCE_CHECK or UNKNOWN)
-        return res.json({
-            success: true,
-            intent: intentData.intent,
-            rawAiResponse: intentData
-        });
-
-    } catch (error: any) {
-        console.error('[bot-router] AI parsing failed:', error);
-        return res.status(500).json({ error: 'Failed to process message with the AI layer.' });
     }
 });
 

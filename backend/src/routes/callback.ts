@@ -1,104 +1,145 @@
 import { Router } from 'express';
+import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { transactions, users } from '../db/schema';
-import { eq } from 'drizzle-orm';
-import { getClient } from '../lib/openPayments';
-import { bot } from '../index';
-import { Grant } from '@interledger/open-payments';
+import { getClient, isFinalizedGrant } from '../lib/openPayments';
+import { Bot } from 'grammy';
 
-const router = Router();
+const bot = new Bot(process.env.BOT_TOKEN || '');
+export const callbackRouter = Router();
 
-router.get('/', async (req, res) => {
-    const { interact_ref, nonce } = req.query;
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/callback
+//
+// GNAP redirect endpoint — the user's wallet auth server redirects their
+// browser here after they approve or deny the payment consent screen.
+//
+// On success:    ?interact_ref=...&transactionId=...
+// On rejection:  ?result=grant_rejected&transactionId=...
+// ─────────────────────────────────────────────────────────────────────────────
+callbackRouter.get('/', async (req, res) => {
+    const { interact_ref, transactionId, result } = req.query as Record<string, string>;
 
-    if (!interact_ref || !nonce) {
-        return res.status(400).send("Missing required callback parameters.");
+    if (!transactionId) {
+        return res.status(400).send('Missing transactionId in callback query');
+    }
+
+    const [tx] = await db
+        .select()
+        .from(transactions)
+        .where(eq(transactions.id, transactionId));
+
+    if (!tx || tx.status !== 'AWAITING_GRANT') {
+        return res.status(400).send(page('Payment not found or already processed.', false));
+    }
+
+    // 1. User declined consent at their wallet
+    if (!interact_ref || result === 'grant_rejected') {
+        await db
+            .update(transactions)
+            .set({
+                status:       'FAILED',
+                errorMessage: result === 'grant_rejected'
+                    ? 'Payment declined — you cancelled the authorisation at your wallet.'
+                    : 'Authorisation did not complete. Please try again.',
+                updatedAt: new Date(),
+            })
+            .where(eq(transactions.id, transactionId));
+
+        // NOTIFY: Send cancellation alert on Telegram [1]
+        const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
+        if (sender) {
+            await bot.api.sendMessage(
+                sender.telegramId,
+                `❌ *Payment Cancelled!*\n\nYou declined the authorization request at your wallet.`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+
+        return res.send(page('Payment cancelled. Return to Telegram and try again.', false));
     }
 
     try {
-        // 1. Find the transaction by matching the nonce
-        const tx = await db.select().from(transactions).where(eq(transactions.grantInteractNonce, nonce as string)).get();
-        if (!tx) {
-            return res.status(404).send("Transaction not found for this authorization session.");
-        }
-
-        // 2. Load the sender profile to get their wallet address and telegramId
-        const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
-        if (!sender) {
-            return res.status(404).send("Sender user profile not found.");
-        }
-
         const client = await getClient();
 
-        const finalGrant = (await client.grant.continue(
+        const finalizedGrant = await client.grant.continue(
             { url: tx.grantContinueUri!, accessToken: tx.grantContinueToken! },
-            { interact_ref: interact_ref as string }
-        )) as Grant;
+            { interact_ref }
+        );
 
-
-        if (!finalGrant.access_token) {
-            throw new Error('Access token is missing from completed grant continuation.');
+        if (!isFinalizedGrant(finalizedGrant)) {
+            throw new Error('Grant continuation did not return an access token.');
         }
 
-        const senderWallet = await client.walletAddress.get({ url: sender.walletAddress! });
+        const sendingWallet = await client.walletAddress.get({ url: tx.senderWalletAddress });
 
-        // 5. Create the Outgoing Payment to transfer the funds [1]
         const outgoingPayment = await client.outgoingPayment.create(
-            { url: senderWallet.resourceServer, accessToken: finalGrant.access_token.value },
-            { walletAddress: senderWallet.id, quoteId: tx.quoteUrl! }
-        );
-
-        // 6. Update transaction status in SQLite to COMPLETED
-        await db.update(transactions)
-            .set({
-                status: 'COMPLETED',
-                outgoingPaymentUrl: outgoingPayment.id,
-                updatedAt: new Date()
-            })
-            .where(eq(transactions.id, tx.id));
-
-        // 7. Send success notification directly to the user's private Telegram chat [1]
-        const friendlyAmount = (Number(tx.debitAmount) / 100).toFixed(2);
-        await bot.api.sendMessage(
-            sender.telegramId,
-            `🎉 *Payment Successful!*\n\nYou have successfully sent *${friendlyAmount} ${tx.assetCode}*.\n\nThank you for using BotPay!`,
-            { parse_mode: 'Markdown' }
-        );
-
-        // 8. Redirect browser back to your Telegram Bot interface [1]
-        const botUsername = process.env.BOT_USERNAME || 'YOUR_BOT_USERNAME';
-        return res.redirect(`https://t.me/${botUsername}`);
-
-    } catch (error: any) {
-        console.error('[callback] payment execution failed:', error);
-
-        // Update transaction status to FAILED in SQLite and notify the user
-        try {
-            const tx = await db.select().from(transactions).where(eq(transactions.grantInteractNonce, nonce as string)).get();
-            if (tx) {
-                await db.update(transactions)
-                    .set({
-                        status: 'FAILED',
-                        errorMessage: error.message || 'Payment execution failed.',
-                        updatedAt: new Date()
-                    })
-                    .where(eq(transactions.id, tx.id));
-
-                const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
-                if (sender) {
-                    await bot.api.sendMessage(
-                        sender.telegramId,
-                        `Payment Failed!*\n\nYour transaction could not be completed.\nReason: _${error.message || 'Unknown error'}_`,
-                        { parse_mode: 'Markdown' }
-                    );
-                }
+            {
+                url:         sendingWallet.resourceServer,
+                accessToken: finalizedGrant.access_token.value,
+            },
+            {
+                walletAddress: sendingWallet.id,
+                quoteId:       tx.quoteUrl!,
+                metadata:      { description: 'IOU payment' },
             }
-        } catch (dbError) {
-            console.error('[callback] failed to update transaction status to FAILED', dbError);
+        );
+
+        await db
+            .update(transactions)
+            .set({
+                status:             'COMPLETED',
+                outgoingPaymentUrl: outgoingPayment.id,
+                updatedAt:          new Date(),
+            })
+            .where(eq(transactions.id, transactionId));
+
+        // NOTIFY: Send Telegram message via the bot API on SUCCESS [1]
+        const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
+        if (sender) {
+            const friendlyAmount = (Number(tx.debitAmount) / Math.pow(10, tx.assetScale)).toFixed(2);
+            await bot.api.sendMessage(
+                sender.telegramId,
+                `Payment Successful!*\n\nYou have successfully sent *${friendlyAmount} ${tx.assetCode}*.\n\nThank you for using BotPay!`,
+                { parse_mode: 'Markdown' }
+            );
         }
 
-        return res.status(500).send(`Payment failed. ${error.message}`);
+        res.send(page('Payment sent! Return to Telegram.', true));
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[callback] Payment failed:', message);
+
+        await db
+            .update(transactions)
+            .set({ status: 'FAILED', errorMessage: message, updatedAt: new Date() })
+            .where(eq(transactions.id, transactionId));
+
+        const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
+        if (sender) {
+            await bot.api.sendMessage(
+                sender.telegramId,
+                `Payment Failed!\n\nYour transaction could not be completed.\nReason: _${message}_`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+
+        res.send(page(`Payment failed: ${message}`, false));
     }
 });
 
-export { router as callbackRouter };
+// Minimal HTML page shown in the user's browser after the consent redirect.
+// Tells them to go back to Telegram — no frontend to redirect to.
+function page(message: string, success: boolean): string {
+    const colour = success ? '#22c55e' : '#ef4444';
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IOU</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0;background:#0f172a;color:#f8fafc}
+.box{text-align:center;padding:2rem}.icon{font-size:3rem}
+p{font-size:1.1rem;color:#94a3b8}h2{color:${colour}}</style></head>
+<body><div class="box"><div class="icon">${success ? '✓' : '✗'}</div>
+<h2>${message}</h2><p>You can close this tab and return to Telegram.</p>
+</div></body></html>`;
+}
