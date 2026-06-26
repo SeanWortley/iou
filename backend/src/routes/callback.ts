@@ -5,17 +5,14 @@ import { transactions, users } from '../db/schema';
 import { getClient, isFinalizedGrant } from '../lib/openPayments';
 import { Bot } from 'grammy';
 
+// 1. IMPORT the session trackers from bot.ts [1]
+import { activeSessions, txToSessionMap } from './bot';
+
 const bot = new Bot(process.env.BOT_TOKEN || '');
 export const callbackRouter = Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/callback
-//
-// GNAP redirect endpoint — the user's wallet auth server redirects their
-// browser here after they approve or deny the payment consent screen.
-//
-// On success:    ?interact_ref=...&transactionId=...
-// On rejection:  ?result=grant_rejected&transactionId=...
 // ─────────────────────────────────────────────────────────────────────────────
 callbackRouter.get('/', async (req, res) => {
     const { interact_ref, transactionId, result } = req.query as Record<string, string>;
@@ -33,7 +30,6 @@ callbackRouter.get('/', async (req, res) => {
         return res.status(400).send(page('Payment not found or already processed.', false));
     }
 
-    // 1. User declined consent at their wallet
     if (!interact_ref || result === 'grant_rejected') {
         await db
             .update(transactions)
@@ -46,13 +42,12 @@ callbackRouter.get('/', async (req, res) => {
             })
             .where(eq(transactions.id, transactionId));
 
-        // NOTIFY: Send cancellation alert on Telegram [1]
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
         if (sender) {
             await bot.api.sendMessage(
                 sender.telegramId,
                 `❌ <b>Payment Cancelled!</b>\n\nYou declined the authorization request at your wallet.`,
-                { parse_mode: 'HTML' } // Changed to HTML [1]
+                { parse_mode: 'HTML' }
             );
         }
 
@@ -99,14 +94,58 @@ callbackRouter.get('/', async (req, res) => {
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
         if (sender) {
             const friendlyAmount = (Number(tx.debitAmount) / Math.pow(10, tx.assetScale)).toFixed(2);
-            await bot.api.sendMessage(
-                sender.telegramId,
-                `🎉 <b>Payment Successful!</b>\n\nYou have successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\nThank you for using BotPay!`,
-                { parse_mode: 'HTML' }
-            );
+
+            // 2. CHECK IF THIS TRANSACTION HAS A QUEUED SESSION [1]
+            const sessionId = txToSessionMap.get(tx.id);
+            let redirectPageText = 'Payment sent! Return to Telegram.';
+
+            if (sessionId) {
+                const session = activeSessions.get(sessionId);
+                if (session) {
+                    // Increment the index to move to the next queued transaction [1]
+                    session.currentIndex++;
+
+                    if (session.currentIndex < session.transactions.length) {
+                        const nextTx = session.transactions[session.currentIndex];
+                        const botUsername = process.env.BOT_USERNAME || 'open_payments_iou_bot';
+
+                        // Notify user and send a deep link button for the next payment in the batch [1]
+                        await bot.api.sendMessage(
+                            sender.telegramId,
+                            `🎉 <b>Payment [${session.currentIndex}/${session.transactions.length}] Successful!</b>\n\nYou successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\n👉 Click below to authorize the next payment in your queue: <b>${nextTx.amount.toFixed(2)} ${nextTx.currency} to ${nextTx.recipientName}</b>:`,
+                            {
+                                parse_mode: 'HTML',
+                                reply_markup: {
+                                    inline_keyboard: [
+                                        [{ text: "🔐 Authorize Next Payment", url: `https://t.me/${botUsername}?start=pay_${nextTx.amount}_${nextTx.recipientName.replace(/[^a-zA-Z0-9_]/g, "")}` }]
+                                    ]
+                                }
+                            }
+                        );
+
+                        redirectPageText = 'First payment complete! Return to Telegram to authorize the next payment.';
+                    } else {
+                        // Finished the entire batch! [1]
+                        await bot.api.sendMessage(
+                            sender.telegramId,
+                            `🎉 <b>All Queue Payments Successful!</b>\n\nAll payments in your transaction batch have been completed successfully. Thank you for using BotPay!`,
+                            { parse_mode: 'HTML' }
+                        );
+                        activeSessions.delete(sessionId);
+                    }
+                }
+            } else {
+                // Fallback for single standard payments [1]
+                await bot.api.sendMessage(
+                    sender.telegramId,
+                    `🎉 <b>Payment Successful!</b>\n\nYou have successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\nThank you for using BotPay!`,
+                    { parse_mode: 'HTML' }
+                );
+            }
+
+            res.send(page(redirectPageText, true));
         }
 
-        res.send(page('Payment sent! Return to Telegram.', true));
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error('[callback] Payment failed:', message);
@@ -118,8 +157,7 @@ callbackRouter.get('/', async (req, res) => {
 
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
         if (sender) {
-            // 🛡️ SAFELY CLEAN ERROR MESSAGE: Strips out tags to prevent HTML parsing crashes [1]
-            const cleanErrorMessage = message
+            const cleanErrorMessage = (message || 'Unknown error')
                 .replace(/&/g, '&amp;')
                 .replace(/</g, '&lt;')
                 .replace(/>/g, '&gt;');
@@ -127,7 +165,7 @@ callbackRouter.get('/', async (req, res) => {
             await bot.api.sendMessage(
                 sender.telegramId,
                 `❌ <b>Payment Failed!</b>\n\nYour transaction could not be completed.\n\nReason: <i>${cleanErrorMessage}</i>`,
-                { parse_mode: 'HTML' } // Changed to HTML to prevent crashes [1]
+                { parse_mode: 'HTML' }
             );
         }
 
@@ -142,7 +180,6 @@ function normalizeWalletAddress(url: string): string {
     }
     return trimmed;
 }
-
 
 function page(message: string, success: boolean): string {
     const colour = success ? '#22c55e' : '#ef4444';

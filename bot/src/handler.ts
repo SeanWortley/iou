@@ -308,9 +308,9 @@ export async function handleBotMessage(ctx: any): Promise<void> {
 
     if (payload.startsWith("pay_")) {
       // 1. Split the payload by underscores to get both amount and recipient [1]
-      const parts = payload.slice("pay_".length).split("_"); // e.g. ["50", "ksrnoa"] or ["50"]
+      const parts = payload.slice("pay_".length).split("_");
       const amount = parts[0];
-      const recipient = parts[1]; // Might be undefined if they only typed "@bot 50" [1]
+      const recipient = parts.slice(1).join("_");
 
       clearPaymentSession(state);
       state.manualAmount = amount;
