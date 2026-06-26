@@ -63,7 +63,7 @@ router.post('/processRegistration', async (req, res) => {
     }
 });
 
-// 3. POST /bot/processPlainText (With multi-payment queue support) [1]
+// 3. POST /bot/processPlainText (With multi-payment queue and DEFAULT currency support) [1]
 router.post('/processPlainText', async (req, res) => {
     const { telegramUserId, text, context, telegramMessage } = req.body;
 
@@ -95,13 +95,48 @@ router.post('/processPlainText', async (req, res) => {
 
         switch (intentData.intent) {
 
+            // ── DYNAMIC LIVE BALANCE CHECK ──
             case 'BALANCE_CHECK': {
                 const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
-                const currency = sender?.assetCode || 'ZAR';
+                if (!sender) {
+                    return res.json({ status: 'error', reason: 'You must register before checking your balance.' });
+                }
+                const currency = sender.assetCode || 'ZAR';
+
+                // Look up all completed transactions for this user in SQLite
+                const completedTxs = await db.select()
+                    .from(transactions)
+                    .where(and(
+                        eq(transactions.userId, sender.id),
+                        eq(transactions.status, 'COMPLETED')
+                    )).all();
+
+                let totalSpent = 0;
+                for (const tx of completedTxs) {
+                    if (tx.debitAmount && tx.assetScale) {
+                        totalSpent += Number(tx.debitAmount) / Math.pow(10, tx.assetScale);
+                    }
+                }
+
+                const startingBalance = 5000.00; // Simulated starting budget
+                const currentBalance = startingBalance - totalSpent;
 
                 return res.json({
+                    status: 'error', // Returning status 'error' displays this text directly in Telegram as a message bubble
+                    reason: `ℹ️ <b>Live Balance Check</b>\n\n` +
+                        `👤 <b>User:</b> ${sender.displayName}\n` +
+                        `🏦 <b>Wallet:</b> <code>${sender.walletAddress}</code>\n` +
+                        `💵 <b>Starting Budget:</b> ${startingBalance.toFixed(2)} ${currency}\n` +
+                        `💸 <b>Total Spent:</b> ${totalSpent.toFixed(2)} ${currency}\n` +
+                        `🎯 <b>Available Balance:</b> <b>${currentBalance.toFixed(2)} ${currency}</b>`
+                });
+            }
+
+            // ── GROUP FUND INTENT ──
+            case 'GROUP_FUND': {
+                return res.json({
                     status: 'error',
-                    reason: `Balance needs to be implement`
+                    reason: '👥 <b>Group Funding / Bill Splitting:</b>\n\nGroup bill pooling is currently in view-only mode. To execute, please send individual payments to members one-by-one!'
                 });
             }
 
@@ -125,6 +160,10 @@ router.post('/processPlainText', async (req, res) => {
                 if (extractedTransactions.length === 0) {
                     return res.json({ status: 'error', reason: 'Could not detect any transaction details.' });
                 }
+
+                // FETCH sender profile to read their native wallet currency (e.g. ZAR or USD) [1]
+                const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+                const senderCurrency = sender?.assetCode || 'ZAR'; // Fallback to ZAR if database column is empty [1]
 
                 const sessionQueue: QueuedTransaction[] = [];
 
@@ -160,12 +199,20 @@ router.post('/processPlainText', async (req, res) => {
                     }
 
                     if (matchedUser && matchedUser.walletAddress) {
+                        // RESOLVE "DEFAULT" CURRENCY: If the AI returned "DEFAULT", fall back to sender's wallet currency [1]
+                        const isDefault = tx.target_currency === 'DEFAULT' || !tx.target_currency;
+                        const finalCurrency = isDefault ? senderCurrency : tx.target_currency;
+
+                        // Set paymentType: If final currency is different from sender's wallet, use FIXED_RECEIVE [1]
+                        const isForeign = finalCurrency !== senderCurrency;
+                        const paymentType = isForeign ? 'FIXED_RECEIVE' : 'FIXED_SEND';
+
                         sessionQueue.push({
                             amount,
-                            currency: tx.target_currency || 'ZAR',
+                            currency: finalCurrency,
                             recipientWallet: matchedUser.walletAddress,
-                            recipientName: matchedUser.displayName,
-                            paymentType: 'FIXED_SEND'
+                            recipientName: matchedUser.displayName || 'Registered User',
+                            paymentType
                         });
                     }
                 }
