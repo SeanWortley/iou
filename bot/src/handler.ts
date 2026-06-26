@@ -258,6 +258,7 @@ export async function handleChatMemberUpdate(ctx: any): Promise<void> {
 export async function handleBotMessage(ctx: any): Promise<void> {
   const msg = ctx.message as any;
   if (!msg) return;
+  console.log("[message]", JSON.stringify(msg, null, 2));
 
   const userId = ctx.from?.id as number | undefined;
   if (!userId) return;
