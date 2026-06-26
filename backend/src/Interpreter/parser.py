@@ -28,7 +28,7 @@ Defines the layout of an individual transaction for genAI
 """
 class TransactionDetail(BaseModel):
     recipients: List[str] = Field(
-        default="CLARIFY",
+        default=["CLARIFY"],
         description=(
             "List of identifiers for the receivers (handles, wallet addresses, phone numbers, or IDs). "
             "If a plain name is used, prioritize matching it to an identifier in the provided roster context."
