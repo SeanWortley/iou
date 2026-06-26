@@ -155,7 +155,7 @@ app.get('/api/health', (_req, res) => {
 
 // Bot Webhook Route
 // To comment out if want to test
-app.post('/api/bot-webhook', webhookCallback(bot, 'express'));
+// app.post('/api/bot-webhook', webhookCallback(bot, 'express'));
 
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
@@ -173,7 +173,7 @@ app.listen(config.port, () => {
     console.log(`\n  OpenRemit backend with Bot Support → http://localhost:${config.port}\n`);
 });
 
-// bot.start();
-// console.log("Polling mode activated: Bot is listening directly to Telegram!");
+bot.start();
+console.log("Polling mode activated: Bot is listening directly to Telegram!");
 
 export { bot };

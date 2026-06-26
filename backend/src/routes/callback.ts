@@ -8,7 +8,7 @@ import { Grant } from '@interledger/open-payments';
 
 const router = Router();
 
-router.get('/callback', async (req, res) => {
+router.get('/', async (req, res) => {
     const { interact_ref, nonce } = req.query;
 
     if (!interact_ref || !nonce) {

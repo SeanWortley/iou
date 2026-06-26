@@ -65,15 +65,19 @@ router.post('/initiate-payment', async (req, res) => {
             throw new Error('Access token is missing from incoming payment grant');
         }
 
-
-        const amountInScale = Math.round(amount * 100).toString();
+        const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
+        const amountInScale = Math.round(amount * scaleMultiplier).toString();
 
         const incomingPayment = await client.incomingPayment.create(
             { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
 
             {
                 walletAddress: receiverWallet.id,
-                incomingAmount: { value: amountInScale, assetCode: currency, assetScale: 2 }
+                incomingAmount: {
+                    value: amountInScale,
+                    assetCode: receiverWallet.assetCode,
+                    assetScale: receiverWallet.assetScale
+                }
             }
         );
 
@@ -133,8 +137,8 @@ router.post('/initiate-payment', async (req, res) => {
                 senderWalletAddress: senderWallet.id,
                 receiverWalletAddress: receiverWallet.id,
                 debitAmount: amountInScale,
-                assetCode: currency,
-                assetScale: 2,
+                assetCode: receiverWallet.assetCode,
+                assetScale: receiverWallet.assetScale,
                 incomingPaymentUrl: incomingPayment.id,
                 quoteUrl: quote.id,
 
