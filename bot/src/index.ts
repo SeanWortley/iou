@@ -6,7 +6,7 @@ loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
 import express from "express";
 import { Bot, webhookCallback } from "grammy";
-import { handleBotMessage, handleCallbackQuery, handleChatMemberUpdate } from "./handler";
+import {handleBotMessage, handleCallbackQuery, handleChatMemberUpdate, handleInlineQuery} from "./handler";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Two ways to run the bot:
@@ -35,6 +35,7 @@ bot.on("message", handleBotMessage);
 bot.on("callback_query:data", handleCallbackQuery);
 // Fires when the bot's own membership changes — used to welcome a new group.
 bot.on("my_chat_member", handleChatMemberUpdate);
+bot.on("inline_query", handleInlineQuery);
 
 // Log (but don't crash on) errors thrown inside handlers.
 bot.catch((err) => {
@@ -49,7 +50,7 @@ async function main(): Promise<void> {
 
   // my_chat_member is included by default, but be explicit so the group
   // welcome reliably fires alongside messages and button taps.
-  const allowedUpdates = ["message", "callback_query", "my_chat_member"] as const;
+  const allowedUpdates = ["message", "callback_query", "my_chat_member", "inline_query"] as const;
 
   if (webhookUrl) {
     // ── Webhook mode (ngrok / any public HTTPS host) ──────────────────────────

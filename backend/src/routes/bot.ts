@@ -9,12 +9,23 @@ import crypto from 'crypto';
 
 const router = Router();
 
-interface PaymentSession {
+interface QueuedTransaction {
     amount: number;
     currency: string;
     recipientWallet: string;
+    recipientName: string;
+    paymentType: 'FIXED_SEND' | 'FIXED_RECEIVE';
 }
-const activeSessions = new Map<string, PaymentSession>();
+
+interface PaymentSession {
+    transactions: QueuedTransaction[];
+    currentIndex: number;
+    telegramUserId: string;
+}
+
+// EXPORTED activeSessions so callbackRouter can read and update the queue [1]
+export const activeSessions = new Map<string, PaymentSession>();
+export const txToSessionMap = new Map<string, string>();
 
 // 1. POST /bot/checkUser
 router.post('/checkUser', async (req, res) => {
@@ -30,19 +41,9 @@ router.post('/checkUser', async (req, res) => {
 
 // 2. POST /bot/processRegistration
 router.post('/processRegistration', async (req, res) => {
-    const { telegramUserId, telegramUsername, phoneNumber, walletAddress, privateKey, password } = req.body;
+    const { telegramUserId, telegramUsername, phoneNumber, walletAddress } = req.body;
 
     try {
-        const salt = crypto.randomBytes(16).toString('base64');
-        const iv = crypto.randomBytes(12).toString('base64');
-
-        const key = crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256');
-
-        const cipher = crypto.createCipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
-        let encrypted = cipher.update(privateKey, 'utf8', 'base64');
-        encrypted += cipher.final('base64');
-        const authTag = cipher.getAuthTag().toString('base64');
-
         const displayName = telegramUsername ? `@${telegramUsername}` : 'User';
 
         await db.insert(users).values({
@@ -51,11 +52,7 @@ router.post('/processRegistration', async (req, res) => {
             telegramUsername: telegramUsername ? `@${telegramUsername}` : null,
             displayName,
             phoneNumber,
-            passwordHash: crypto.createHash('sha256').update(password).digest('hex'),
             walletAddress,
-            privateKeyEncrypted: encrypted,
-            privateKeyIv: iv,
-            privateKeySalt: salt,
             createdAt: new Date(),
         });
 
@@ -66,8 +63,7 @@ router.post('/processRegistration', async (req, res) => {
     }
 });
 
-// Inside backend/src/routes/bot.ts
-
+// 3. POST /bot/processPlainText (With multi-payment queue support) [1]
 router.post('/processPlainText', async (req, res) => {
     const { telegramUserId, text, context, telegramMessage } = req.body;
 
@@ -75,98 +71,140 @@ router.post('/processPlainText', async (req, res) => {
         const isGroup = context?.chatType === 'group' || context?.chatType === 'supergroup';
         const groupTelegramId = context?.chatId?.toString();
 
-        // 1. DYNAMICALLY BUILD THE ROSTER FROM SQLITE [1]
-        // If we are in a group chat, grab the display names of all registered users in this group! [1]
         let groupRoster: string[] = [];
         if (isGroup && groupTelegramId) {
             const members = await db.select({ displayName: users.displayName })
                 .from(users)
                 .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
                 .where(eq(groupMembers.groupTelegramId, groupTelegramId))
-                .all(); // .all() gets the list of rows
-
-            // Map DB rows to a string list: ["@Noah_99", "@Sizwe", ...] [1]
+                .all();
             groupRoster = members.map(m => m.displayName).filter((name): name is string => !!name);
         }
 
-        // 2. Call their FastAPI endpoint on '/parse' [1]
-        const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
-
-        // We send the EXACT keys their UserRequest BaseModel expects! [1]
+        const aiServerUrl = process.env.AI_SERVER_URL || 'http://127.0.0.1:8000/parse';
         const aiResponse = await axios.post(aiServerUrl, {
-            text: text,
+            text,
             chat_event: telegramMessage || {},
-            group_roster: groupRoster // Passes the real SQLite group roster dynamically [1]
+            group_roster: groupRoster
         });
 
-        const intentData = aiResponse.data; // This is the structured PaymentIntent JSON! [1]
-
+        const intentData = aiResponse.data;
         const sessionId = crypto.randomUUID();
 
-        if (intentData.intent !== 'PAYMENT') {
-            return res.json({ status: 'error', reason: 'Only payment instructions are supported right now.' });
-        }
+        console.log('🤖 [AI Parser Response]:\n', JSON.stringify(intentData, null, 2));
 
-        // Retrieve the transaction details from the first item of their extracted list [1]
-        const extractedTx = intentData.transactions?.[0];
-        if (!extractedTx || !extractedTx.recipients?.length) {
-            return res.json({ status: 'error', reason: 'Could not detect who you want to pay.' });
-        }
+        switch (intentData.intent) {
 
-        const recipientQuery = extractedTx.recipients[0].trim(); // First recipient [1]
-        const amount = extractedTx.amount;
+            case 'BALANCE_CHECK': {
+                const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+                const currency = sender?.assetCode || 'ZAR';
 
-        if (!amount || amount <= 0) {
-            return res.json({ status: 'error', reason: 'Please specify a valid payment amount.' });
-        }
+                return res.json({
+                    status: 'error',
+                    reason: `Balance needs to be implement`
+                });
+            }
 
-        // 3. Resolve the recipient globally or within group [1]
-        let matchedUser = null;
-        if (isGroup && groupTelegramId) {
-            matchedUser = await db.select({
-                id: users.id,
-                displayName: users.displayName,
-                walletAddress: users.walletAddress
-            })
-                .from(users)
-                .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
-                .where(and(
-                    eq(groupMembers.groupTelegramId, groupTelegramId),
-                    eq(users.displayName, recipientQuery)
-                )).get();
-        }
+            case 'CLARIFY': {
+                return res.json({
+                    status: 'needs_clarification',
+                    sessionId,
+                    clarifications: [
+                        {
+                            field: 'recipient',
+                            question: '🤔 I could not quite read that. Who would you like to pay, and how much?',
+                            suggestions: []
+                        }
+                    ]
+                });
+            }
 
-        if (!matchedUser) {
-            matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
-            if (!matchedUser) {
-                matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipientQuery)).get();
+            case 'PAYMENT':
+            case 'PAYMENT_MULTIPLE': {
+                const extractedTransactions = intentData.transactions || [];
+                if (extractedTransactions.length === 0) {
+                    return res.json({ status: 'error', reason: 'Could not detect any transaction details.' });
+                }
+
+                const sessionQueue: QueuedTransaction[] = [];
+
+                for (const tx of extractedTransactions) {
+                    const recipientQuery = tx.recipients?.[0]?.trim();
+                    const amount = tx.amount;
+
+                    if (!recipientQuery || !amount || amount <= 0) continue;
+
+                    let matchedUser = null;
+                    if (isGroup && groupTelegramId) {
+                        matchedUser = await db.select({
+                            id: users.id,
+                            displayName: users.displayName,
+                            walletAddress: users.walletAddress
+                        })
+                            .from(users)
+                            .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
+                            .where(and(
+                                eq(groupMembers.groupTelegramId, groupTelegramId),
+                                eq(users.displayName, recipientQuery)
+                            )).get();
+                    }
+
+                    if (!matchedUser) {
+                        matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
+                        if (!matchedUser) {
+                            matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipientQuery)).get();
+                            if (!matchedUser) {
+                                matchedUser = await db.select().from(users).where(eq(users.displayName, recipientQuery)).get();
+                            }
+                        }
+                    }
+
+                    if (matchedUser && matchedUser.walletAddress) {
+                        sessionQueue.push({
+                            amount,
+                            currency: tx.target_currency || 'ZAR',
+                            recipientWallet: matchedUser.walletAddress,
+                            recipientName: matchedUser.displayName,
+                            paymentType: 'FIXED_SEND'
+                        });
+                    }
+                }
+
+                if (sessionQueue.length === 0) {
+                    return res.json({
+                        status: 'error',
+                        reason: 'Could not resolve any registered recipients in the system.'
+                    });
+                }
+
+                activeSessions.set(sessionId, {
+                    transactions: sessionQueue,
+                    currentIndex: 0,
+                    telegramUserId: telegramUserId.toString()
+                });
+
+                const firstTx = sessionQueue[0];
+                const prefix = sessionQueue.length > 1 ? `[1/${sessionQueue.length}] ` : '';
+
+                return res.json({
+                    status: 'ok',
+                    sessionId,
+                    payment: {
+                        amountDisplay: firstTx.amount.toFixed(2),
+                        currency: firstTx.currency,
+                        recipientDisplay: `${prefix}${firstTx.recipientName}`,
+                        recipientWallet: firstTx.recipientWallet
+                    }
+                });
+            }
+
+            default: {
+                return res.json({
+                    status: 'error',
+                    reason: 'I was unable to understand your request.'
+                });
             }
         }
-
-        if (!matchedUser || !matchedUser.walletAddress) {
-            return res.json({
-                status: 'error',
-                reason: `Could not find a registered user named "${recipientQuery}" in our system.`
-            });
-        }
-
-        // Save to our active payment sessions map [1]
-        activeSessions.set(sessionId, {
-            amount,
-            currency: extractedTx.target_currency || 'ZAR',
-            recipientWallet: matchedUser.walletAddress
-        });
-
-        return res.json({
-            status: 'ok',
-            sessionId,
-            payment: {
-                amountDisplay: amount.toFixed(2),
-                currency: extractedTx.target_currency || 'ZAR',
-                recipientDisplay: matchedUser.displayName,
-                recipientWallet: matchedUser.walletAddress
-            }
-        });
 
     } catch (error) {
         console.error('processPlainText failed:', error);
@@ -206,8 +244,11 @@ router.post('/joinGroup', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. POST /bot/authorizePayment (FIXED TYPE ERRORS ON currentTx METADATA) [1]
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/authorizePayment', async (req, res) => {
-    const { telegramUserId, sessionId, password } = req.body;
+    const { telegramUserId, sessionId } = req.body;
 
     try {
         const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
@@ -215,29 +256,19 @@ router.post('/authorizePayment', async (req, res) => {
             return res.status(404).json({ error: 'Sender not registered.' });
         }
 
-        // Verify Password
-        const derivedHash = crypto.createHash('sha256').update(password).digest('hex');
-        if (derivedHash !== sender.passwordHash) {
-            return res.status(401).json({ error: 'Invalid password' });
-        }
-
-        // Retrieve active session details [1]
         const session = activeSessions.get(sessionId);
-        if (!session) {
+        if (!session || !session.transactions[session.currentIndex]) {
             return res.status(400).json({ error: 'Session expired or invalid.' });
         }
 
+        // GRAB transaction details from currentTx [1]
+        const currentTx = session.transactions[session.currentIndex];
+
         const client = await getClient();
 
-        // Resolve wallets
-        const senderWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(sender.walletAddress)
-        });
-        const receiverWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(session.recipientWallet) // Wrapped here! [1]
-        });
+        const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress) });
+        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(currentTx.recipientWallet) }); // FIXED reference to currentTx [1]
 
-        // Request incoming-payment grant
         const incomingGrant = await client.grant.request(
             { url: receiverWallet.authServer },
             { access_token: { access: [{ type: 'incoming-payment', actions: ['create', 'read'] }] } }
@@ -247,41 +278,68 @@ router.post('/authorizePayment', async (req, res) => {
             throw new Error('Expected non-interactive incoming payment grant');
         }
 
-        // Calculate scale dynamically
-        const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
-        const amountInScale = Math.round(session.amount * scaleMultiplier).toString();
+        let incomingPayment;
+        let quote;
 
-        // Create incoming payment
-        const incomingPayment = await client.incomingPayment.create(
-            { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
-            {
-                walletAddress: receiverWallet.id,
-                incomingAmount: { value: amountInScale, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale }
+        if (currentTx.paymentType === 'FIXED_RECEIVE') { // FIXED reference to currentTx [1]
+            const scaleMultiplier = Math.pow(10, receiverWallet.assetScale);
+            const amountInScale = Math.round(currentTx.amount * scaleMultiplier).toString(); // FIXED reference to currentTx [1]
+
+            incomingPayment = await client.incomingPayment.create(
+                { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+                {
+                    walletAddress: receiverWallet.id,
+                    incomingAmount: { value: amountInScale, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale }
+                }
+            );
+
+            const quoteGrant = await client.grant.request(
+                { url: senderWallet.authServer },
+                { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
+            );
+
+            if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
+                throw new Error('Expected non-interactive quote grant');
             }
-        );
 
-        // Request quote grant
-        const quoteGrant = await client.grant.request(
-            { url: senderWallet.authServer },
-            { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
-        );
+            quote = await client.quote.create(
+                { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+                {
+                    walletAddress: senderWallet.id,
+                    receiveAmount: incomingPayment.incomingAmount,
+                    receiver: incomingPayment.id,
+                    method: 'ilp'
+                }
+            );
+        } else {
+            const scaleMultiplier = Math.pow(10, senderWallet.assetScale);
+            const amountInScale = Math.round(currentTx.amount * scaleMultiplier).toString(); // FIXED reference to currentTx [1]
 
-        if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
-            throw new Error('Expected non-interactive quote grant');
+            incomingPayment = await client.incomingPayment.create(
+                { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+                { walletAddress: receiverWallet.id }
+            );
+
+            const quoteGrant = await client.grant.request(
+                { url: senderWallet.authServer },
+                { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } }
+            );
+
+            if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
+                throw new Error('Expected non-interactive quote grant');
+            }
+
+            quote = await client.quote.create(
+                { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+                {
+                    walletAddress: senderWallet.id,
+                    debitAmount: { value: amountInScale, assetCode: senderWallet.assetCode, assetScale: senderWallet.assetScale },
+                    receiver: incomingPayment.id,
+                    method: 'ilp'
+                }
+            );
         }
 
-        // Create quote
-        const quote = await client.quote.create(
-            { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
-            {
-                walletAddress: senderWallet.id,
-                receiveAmount: incomingPayment.incomingAmount,
-                receiver: incomingPayment.id,
-                method: 'ilp'
-            }
-        );
-
-        // Request interactive outgoing payment grant
         const interactNonce = crypto.randomUUID();
         const txId = crypto.randomUUID();
         const callbackUrl = `${process.env.BACKEND_URL}/api/callback?transactionId=${txId}`;
@@ -310,12 +368,12 @@ router.post('/authorizePayment', async (req, res) => {
             await db.insert(transactions).values({
                 id: txId,
                 status: 'AWAITING_GRANT',
-                paymentType: 'FIXED_SEND',
+                paymentType: currentTx.paymentType, // FIXED reference to currentTx [1]
                 senderWalletAddress: senderWallet.id,
                 receiverWalletAddress: receiverWallet.id,
-                debitAmount: amountInScale,
-                assetCode: receiverWallet.assetCode,
-                assetScale: receiverWallet.assetScale,
+                debitAmount: quote.debitAmount.value,
+                assetCode: senderWallet.assetCode,
+                assetScale: senderWallet.assetScale,
                 incomingPaymentUrl: incomingPayment.id,
                 quoteUrl: quote.id,
 
@@ -327,6 +385,9 @@ router.post('/authorizePayment', async (req, res) => {
                 createdAt: now,
                 updatedAt: now
             });
+
+            // Map txId to parent sessionId [1]
+            txToSessionMap.set(txId, sessionId);
 
             return res.json({
                 interactUrl: outgoingGrant.interact.redirect,
@@ -341,10 +402,7 @@ router.post('/authorizePayment', async (req, res) => {
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // 6. POST /bot/buildPayment
-// The manual path wizard. No AI required — recipient and amount are structured. [1]
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/buildPayment', async (req, res) => {
     const { telegramUserId, recipient, amount, paymentType } = req.body;
 
@@ -352,10 +410,8 @@ router.post('/buildPayment', async (req, res) => {
         let recipientWallet = '';
         let recipientName = 'External Wallet';
 
-        // Uncomment getClient at the top of your imports if you commented it out! [1]
         const client = await getClient();
 
-        // 1. Resolve recipient based on the manual builder selection [1]
         if (recipient.type === 'phone') {
             const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipient.value.trim())).get();
             if (!matchedUser || !matchedUser.walletAddress) {
@@ -374,7 +430,6 @@ router.post('/buildPayment', async (req, res) => {
             recipientName = matchedUser.displayName || 'Registered User';
         }
         else if (recipient.type === 'wallet') {
-            // Direct out-of-ecosystem payment to a raw wallet pointer [1]
             recipientWallet = recipient.value.trim();
             try {
                 const resolvedWallet = await client.walletAddress.get({ url: recipientWallet });
@@ -384,17 +439,28 @@ router.post('/buildPayment', async (req, res) => {
             }
         }
 
-        const receiverWallet = await client.walletAddress.get({
-            url: normalizeWalletAddress(recipientWallet)
-        });
-        const currency = receiverWallet.assetCode; // e.g. "USD" or "ZAR"
+        const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+        if (!sender) {
+            return res.status(404).json({ error: 'Sender not registered.' });
+        }
+
+        const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress!) });
+        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(recipientWallet) });
+
+        const currency = (paymentType === 'FIXED_SEND') ? senderWallet.assetCode : receiverWallet.assetCode;
 
         const sessionId = crypto.randomUUID();
 
         activeSessions.set(sessionId, {
-            amount: parseFloat(amount),
-            currency,
-            recipientWallet
+            transactions: [{
+                amount: parseFloat(amount),
+                currency,
+                recipientWallet,
+                recipientName,
+                paymentType: paymentType as 'FIXED_SEND' | 'FIXED_RECEIVE'
+            }],
+            currentIndex: 0,
+            telegramUserId: telegramUserId.toString()
         });
 
         return res.json({
@@ -414,21 +480,15 @@ router.post('/buildPayment', async (req, res) => {
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // 7. POST /bot/confirmPayment
-// User confirmed the payment interpretation is correct (no money has moved yet) [1].
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/confirmPayment', async (req, res) => {
     const { telegramUserId, sessionId } = req.body;
 
     try {
-        // Verify the payment session exists in our memory cache [1]
         const session = activeSessions.get(sessionId);
         if (!session) {
             return res.status(400).json({ error: 'Payment session expired or not found.' });
         }
-
-        // Acknowledge the confirmation
         return res.json({ ok: true });
     } catch (error) {
         console.error('confirmPayment failed:', error);
@@ -436,22 +496,17 @@ router.post('/confirmPayment', async (req, res) => {
     }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
 // 8. POST /bot/finalizePayment
-// We check SQLite to see if the callback route successfully completed the transfer [1].
-// ─────────────────────────────────────────────────────────────────────────────
 router.post('/finalizePayment', async (req, res) => {
     const { telegramUserId, transactionId } = req.body;
 
     try {
-        // Find the transaction in SQLite [1]
         const tx = await db.select().from(transactions).where(eq(transactions.id, transactionId)).get();
 
         if (!tx) {
             return res.json({ status: 'FAILED', detail: 'Transaction not found.' });
         }
 
-        // Return the status based on whether /api/callback completed the ledger transfer [1]
         if (tx.status === 'COMPLETED') {
             return res.json({ status: 'COMPLETED' });
         }
@@ -460,7 +515,6 @@ router.post('/finalizePayment', async (req, res) => {
             return res.json({ status: 'FAILED', detail: tx.errorMessage || 'Ledger transfer failed.' });
         }
 
-        // If still in AWAITING_GRANT, the redirect callback hasn't finished executing yet [1]
         return res.json({
             status: 'FAILED',
             detail: 'Authorization not detected on the ledger yet. Please ensure you have approved the payment in your wallet.'
@@ -472,7 +526,6 @@ router.post('/finalizePayment', async (req, res) => {
     }
 });
 
-// Helper to safely convert payment pointers ($ilp...) to standard https:// URLs [1]
 function normalizeWalletAddress(url: string): string {
     const trimmed = url.trim();
     if (trimmed.startsWith('$')) {

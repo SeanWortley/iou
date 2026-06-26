@@ -304,8 +304,53 @@ export async function handleBotMessage(ctx: any): Promise<void> {
     : "";
 
   if (command === "/start") {
-    // Deep-link payload: "join_<groupId>" enrols the user in that group.
-    const groupId = afterCommand.startsWith("join_") ? afterCommand.slice("join_".length) : undefined;
+    const payload = afterCommand;
+
+    if (payload.startsWith("pay_")) {
+      // 1. Split the payload by underscores to get both amount and recipient [1]
+      const parts = payload.slice("pay_".length).split("_");
+      const amount = parts[0];
+      const recipient = parts.slice(1).join("_");
+
+      clearPaymentSession(state);
+      state.manualAmount = amount;
+
+      if (recipient) {
+        const recipientType = recipient.match(/^\d+$/) ? "phone" : "username";
+        const manualRecipient = recipient.match(/^\d+$/) ? recipient : `@${recipient}`;
+
+        // 1. Alert them that we are preparing the card
+        await ctx.reply(`⏳ Preparing your payment of ${amount} ZAR to ${manualRecipient}...`);
+
+        // 2. Automatically call buildPayment in the background! [1]
+        let result: ParseResult;
+        try {
+          result = await buildPayment({
+            telegramUserId: userId,
+            recipient: { type: recipientType, value: manualRecipient },
+            amount: amount,
+            paymentType: "FIXED_SEND", // Default to FIXED_SEND (backend resolves currency dynamically) [1]
+          });
+        } catch (error) {
+          console.error("buildPayment failed", error);
+          await ctx.reply("Couldn't prepare the payment. Please try again.");
+          return;
+        }
+
+        // 3. Immediately show the final "Confirm / Cancel" card [1]
+        await renderParseResult(state, replySend(ctx), result);
+        return;
+      }
+
+      // Fallback: If no recipient was specified, ask for their identity type as normal [1]
+      state.step = "awaiting_manual_recipient_type";
+      await ctx.reply("👤 Who are you paying? Choose how to identify them:", {
+        reply_markup: recipientTypeKeyboard,
+      });
+      return;
+    }
+
+    const groupId = payload.startsWith("join_") ? payload.slice("join_".length) : undefined;
 
     if (await isRegistered(userId)) {
       if (groupId) {
@@ -750,4 +795,53 @@ export async function handleCallbackQuery(ctx: any): Promise<void> {
     }
     return;
   }
+}
+
+export async function handleInlineQuery(ctx: any): Promise<void> {
+  const query = ctx.inlineQuery?.query?.trim() as string | undefined;
+  if (!query) return;
+
+  // Split query by spaces (e.g. "@ksrnoa 50" or "50")
+  const parts = query.split(/\s+/);
+
+  let recipient = "";
+  let amountStr = "";
+
+  if (parts.length >= 2) {
+    recipient = parts[0]; // e.g., "@ksrnoa" [1]
+    amountStr = parts[1]; // e.g., "50"
+  } else {
+    amountStr = parts[0]; // e.g., "50"
+  }
+
+  const amount = parseFloat(amountStr);
+  if (isNaN(amount) || amount <= 0) return;
+
+  const botUsername = process.env.BOT_USERNAME || 'open_payments_iou_bot';
+
+  // Format the deep-link payload: remove '@' or special symbols for deep-link compatibility [1]
+  const cleanRecipient = recipient.replace(/[^a-zA-Z0-9_]/g, "");
+  const startPayload = cleanRecipient ? `pay_${amount}_${cleanRecipient}` : `pay_${amount}`; // e.g. "pay_50_ksrnoa" [1]
+
+  await ctx.answerInlineQuery([
+    {
+      type: "article",
+      id: `pay_${amount}_${Date.now()}`,
+      title: recipient ? `💸 Send ${amount.toFixed(2)} ZAR to ${recipient}` : `💸 Send ${amount.toFixed(2)} ZAR`,
+      description: recipient
+          ? `Instant R${amount.toFixed(2)} payment card to ${recipient}.`
+          : `Send a payment card for ${amount.toFixed(2)} ZAR.`,
+      input_message_content: {
+        message_text: recipient
+            ? `💸 <b>Payment request to ${recipient}</b>\n\n<b>Amount:</b> ${amount.toFixed(2)} ZAR\n\nTap below to securely authorize and execute this payment.`
+            : `💸 <b>Payment request</b>\n\n<b>Amount:</b> ${amount.toFixed(2)} ZAR\n\nTap below to securely authorize and execute this payment.`,
+        parse_mode: "HTML"
+      },
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔐 Authorize & Pay", url: `https://t.me/${botUsername}?start=${startPayload}` }]
+        ]
+      }
+    }
+  ]);
 }
