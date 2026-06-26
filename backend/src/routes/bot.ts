@@ -94,7 +94,7 @@ router.post('/processRegistration', async (req, res) => {
     }
 });
 
-// 3. POST /bot/processPlainText (With multi-payment queue and DEFAULT currency support) [1]
+// 3. POST /bot/processPlainText (With multi-payment queue and dynamic network currency resolution) [1]
 router.post('/processPlainText', async (req, res) => {
     const { telegramUserId, text, context, telegramMessage } = req.body;
 
@@ -126,15 +126,15 @@ router.post('/processPlainText', async (req, res) => {
 
         switch (intentData.intent) {
 
-            // ── DYNAMIC LIVE BALANCE CHECK ──
             case 'BALANCE_CHECK': {
                 const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
                 if (!sender) {
-                    return res.json({ status: 'error', reason: 'You must register before checking your balance.' });
+                    return res.json({ status: 'error', reason: 'You must register first.' });
                 }
-                const currency = sender.assetCode || 'ZAR';
+                const client = await getClient();
+                const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress!) });
+                const currency = senderWallet.assetCode;
 
-                // Look up all completed transactions for this user in SQLite
                 const completedTxs = await db.select()
                     .from(transactions)
                     .where(and(
@@ -149,11 +149,11 @@ router.post('/processPlainText', async (req, res) => {
                     }
                 }
 
-                const startingBalance = 5000.00; // Simulated starting budget
+                const startingBalance = 5000.00;
                 const currentBalance = startingBalance - totalSpent;
 
                 return res.json({
-                    status: 'error', // Returning status 'error' displays this text directly in Telegram as a message bubble
+                    status: 'error',
                     reason: `ℹ️ <b>Live Balance Check</b>\n\n` +
                         `👤 <b>User:</b> ${sender.displayName}\n` +
                         `🏦 <b>Wallet:</b> <code>${sender.walletAddress}</code>\n` +
@@ -163,7 +163,6 @@ router.post('/processPlainText', async (req, res) => {
                 });
             }
 
-            // ── GROUP FUND INTENT ──
             case 'GROUP_FUND': {
                 return res.json({
                     status: 'error',
@@ -172,15 +171,13 @@ router.post('/processPlainText', async (req, res) => {
             }
 
             case 'CLARIFY': {
-                // Top-level CLARIFY = the AI couldn't tell what the user wants at
-                // all → the "intent" pathway (vs. a known payment missing a field).
                 return res.json({
                     status: 'needs_clarification',
                     sessionId,
                     clarifications: [
                         {
-                            field: 'intent',
-                            question: "🤔 I'm not sure what you meant. What would you like to do?",
+                            field: 'recipient',
+                            question: '🤔 I could not quite read that. Who would you like to pay, and how much?',
                             suggestions: []
                         }
                     ]
@@ -194,9 +191,17 @@ router.post('/processPlainText', async (req, res) => {
                     return res.json({ status: 'error', reason: 'Could not detect any transaction details.' });
                 }
 
-                // FETCH sender profile to read their native wallet currency (e.g. ZAR or USD) [1]
+                // 1. RESOLVE SENDER PROFILE [1]
                 const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
-                const senderCurrency = sender?.assetCode || 'ZAR'; // Fallback to ZAR if database column is empty [1]
+                if (!sender || !sender.walletAddress) {
+                    return res.json({ status: 'error', reason: 'Sender not registered.' });
+                }
+
+                const client = await getClient();
+
+                // 2. DYNAMICALLY RESOLVE SENDER WALLET FROM THE NETWORK [1]
+                const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress) });
+                const senderCurrency = senderWallet.assetCode; // Guaranteed to be "EUR" or "ZAR" based on active network [1]
 
                 const sessionQueue: QueuedTransaction[] = [];
 
@@ -232,11 +237,14 @@ router.post('/processPlainText', async (req, res) => {
                     }
 
                     if (matchedUser && matchedUser.walletAddress) {
-                        // RESOLVE "DEFAULT" CURRENCY: If the AI returned "DEFAULT", fall back to sender's wallet currency [1]
+                        // 3. DYNAMICALLY RESOLVE RECEIVER WALLET FROM NETWORK [1]
+                        const receiverWallet = await client.walletAddress.get({ url: normalizeWalletAddress(matchedUser.walletAddress) });
+
+                        // 4. RESOLVE DEFAULT FLAG: If AI says "DEFAULT", use sender's native wallet currency [1]
                         const isDefault = tx.target_currency === 'DEFAULT' || !tx.target_currency;
                         const finalCurrency = isDefault ? senderCurrency : tx.target_currency;
 
-                        // Set paymentType: If final currency is different from sender's wallet, use FIXED_RECEIVE [1]
+                        // 5. CHOOSE PAYMENT TYPE DYNAMICALLY [1]
                         const isForeign = finalCurrency !== senderCurrency;
                         const paymentType = isForeign ? 'FIXED_RECEIVE' : 'FIXED_SEND';
 
@@ -251,85 +259,10 @@ router.post('/processPlainText', async (req, res) => {
                 }
 
                 if (sessionQueue.length === 0) {
-                    // Classify WHY nothing resolved so the bot asks the right thing:
-                    // recipient known but amount missing → "amount"; else → "recipient".
-                    const tx0 = extractedTransactions[0] || {};
-                    const recipientQuery = tx0.recipients?.[0]?.trim();
-                    const amount = tx0.amount;
-                    const currency = tx0.target_currency || 'ZAR';
-                    const matched = await resolveRecipient(recipientQuery, isGroup, groupTelegramId);
-
-                    if (matched?.walletAddress && (!amount || amount <= 0)) {
-                        return res.json({
-                            status: 'needs_clarification',
-                            sessionId,
-                            payment: { recipientDisplay: matched.displayName, recipientWallet: matched.walletAddress },
-                            clarifications: [{
-                                field: 'amount',
-                                question: `💸 How much should I send to ${matched.displayName}? (numbers only, e.g. 50)`,
-                                suggestions: [],
-                            }],
-                        });
-                    }
-
                     return res.json({
-                        status: 'needs_clarification',
-                        sessionId,
-                        payment: (amount && amount > 0) ? { amountDisplay: amount.toFixed(2), currency } : undefined,
-                        clarifications: [{
-                            field: 'recipient',
-                            question: (amount && amount > 0)
-                                ? `👤 Who should I send ${amount.toFixed(2)} ${currency} to? Send their @username, phone, or wallet.`
-                                : `👤 Who would you like to pay? Send their @username, phone, or wallet.`,
-                            suggestions: groupRoster,
-                        }],
+                        status: 'error',
+                        reason: 'Could not resolve any registered recipients in the system.'
                     });
-                }
-
-                // ── Currency clarification ───────────────────────────────────
-                // If the requested currency matches NEITHER wallet (and the two
-                // wallets differ), we can't pick which side to fix — ask the user
-                // to choose between the sender's and the recipient's currency.
-                const checkTx = sessionQueue[0];
-                const senderRow = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
-                if (senderRow?.walletAddress) {
-                    try {
-                        const opClient = await getClient();
-                        const [senderWallet, recipientWallet] = await Promise.all([
-                            opClient.walletAddress.get({ url: normalizeWalletAddress(senderRow.walletAddress) }),
-                            opClient.walletAddress.get({ url: normalizeWalletAddress(checkTx.recipientWallet) }),
-                        ]);
-                        const requested = (checkTx.currency || '').toUpperCase();
-                        const senderCur = senderWallet.assetCode;
-                        const recipientCur = recipientWallet.assetCode;
-
-                        // Clarify whenever the requested currency matches NEITHER
-                        // wallet — even if both wallets share the same currency.
-                        if (requested && requested !== senderCur && requested !== recipientCur) {
-                            const sameCur = senderCur === recipientCur;
-                            return res.json({
-                                status: 'needs_clarification',
-                                sessionId,
-                                payment: {
-                                    amountDisplay: checkTx.amount.toFixed(2),
-                                    recipientDisplay: checkTx.recipientName,
-                                    recipientWallet: checkTx.recipientWallet,
-                                },
-                                clarifications: [{
-                                    field: 'currency',
-                                    // suggestions[0] = sender's currency, suggestions[1] = recipient's.
-                                    // Collapses to a single entry when both wallets share a currency.
-                                    question: sameCur
-                                        ? `⚠️ You asked to pay in ${requested}, but both wallets use ${senderCur}. Pay in ${senderCur} instead?`
-                                        : `⚠️ You asked to pay in ${requested}, but your wallet sends ${senderCur} and theirs receives ${recipientCur}. Which currency should I use?`,
-                                    suggestions: sameCur ? [senderCur] : [senderCur, recipientCur],
-                                }],
-                            });
-                        }
-                    } catch (e) {
-                        console.error('currency check failed (continuing):', e);
-                        // Fail open — let the normal quote flow surface any currency issue.
-                    }
                 }
 
                 activeSessions.set(sessionId, {
@@ -568,7 +501,9 @@ router.post('/buildPayment', async (req, res) => {
         const client = await getClient();
 
         if (recipient.type === 'phone') {
-            const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipient.value.trim())).get();
+            const normalizedPhone = normalizePhoneNumber(recipient.value.trim());
+            const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, normalizedPhone)).get();
+
             if (!matchedUser || !matchedUser.walletAddress) {
                 return res.json({ status: 'error', reason: `No registered user found with phone number "${recipient.value}".` });
             }
@@ -687,6 +622,24 @@ function normalizeWalletAddress(url: string): string {
         return 'https://' + trimmed.substring(1);
     }
     return trimmed;
+}
+
+// Helper to automatically convert local SA phone numbers (060...) to international format (2760...) [1]
+function normalizePhoneNumber(phone: string): string {
+    // Remove any spaces, dashes, or brackets
+    let cleaned = phone.replace(/[^0-9+]/g, '').trim();
+
+    // Strip leading "+" if present (e.g. +2760... -> 2760...)
+    if (cleaned.startsWith('+')) {
+        cleaned = cleaned.substring(1);
+    }
+
+    // If it starts with a local "0" and is 10 digits long, replace "0" with "27" [1]
+    if (cleaned.startsWith('0') && cleaned.length === 10) {
+        cleaned = '27' + cleaned.substring(1);
+    }
+
+    return cleaned;
 }
 
 export default router;
