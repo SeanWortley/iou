@@ -6,26 +6,12 @@ export const users = sqliteTable('users', {
   telegramUsername:       text('telegram_username').unique(), // @username — nullable, not all Telegram users set one
   displayName:            text('display_name').notNull(),
   phoneNumber:            text('phone_number').notNull().unique(),
-  passwordHash:           text('password_hash'),
   walletAddress:          text('wallet_address'),
 
   // Cached from the wallet server-info endpoint on first payment — avoids a
   // network round-trip on every send. Null until populated after first use.
   assetCode:              text('asset_code'),    // e.g. "ZAR"
   assetScale:             integer('asset_scale'), // e.g. 2 → amounts stored in cents
-
-  // Wrong password increments the counter; hitting the limit sets lockedUntil.
-  // Both reset to 0 / null on a successful password check.
-  failedPasswordAttempts: integer('failed_password_attempts').notNull().default(0),
-  lockedUntil:            integer('locked_until', { mode: 'timestamp' }),
-
-  // Interledger private key — encrypted with AES-256-GCM using a key derived
-  // from the user's payment password via PBKDF2. Never stored in plaintext.
-  // To decrypt: PBKDF2(password, privateKeySalt) → AES.decrypt(ciphertext, derivedKey, IV)
-  // Changing the password requires re-encrypting all three of these fields.
-  privateKeyEncrypted:    text('private_key_encrypted'),  // AES-256-GCM ciphertext (base64)
-  privateKeyIv:           text('private_key_iv'),         // AES initialisation vector (base64)
-  privateKeySalt:         text('private_key_salt'),       // PBKDF2 salt (base64)
 
   createdAt:              integer('created_at', { mode: 'timestamp' }).notNull(),
 });
