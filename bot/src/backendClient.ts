@@ -102,6 +102,7 @@ export async function processPlainText(payload: {
   telegramUserId: number;
   text: string;
   context?: ChatContext;
+  telegramMessage?: any;
 }): Promise<ParseResult> {
   return postJson<ParseResult>("/bot/processPlainText", payload);
 }

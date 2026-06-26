@@ -9,7 +9,6 @@ import crypto from 'crypto';
 
 const router = Router();
 
-// IN-MEMORY SESSION STORE: Remembers payment details between parsing and authorizing [1]
 interface PaymentSession {
     amount: number;
     currency: string;
@@ -67,13 +66,14 @@ router.post('/processRegistration', async (req, res) => {
     }
 });
 
-// 3. POST /bot/processPlainText
 router.post('/processPlainText', async (req, res) => {
-    const { telegramUserId, text, context } = req.body;
+    const { telegramUserId, text, context, telegramMessage } = req.body;
 
     try {
         const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
-        const aiResponse = await axios.post(aiServerUrl, { text });
+        const aiResponse = await axios.post(aiServerUrl, {
+            telegram_object: telegramMessage
+        });
         const intentData = aiResponse.data;
 
         const sessionId = crypto.randomUUID();
@@ -119,7 +119,6 @@ router.post('/processPlainText', async (req, res) => {
             });
         }
 
-        // SAVE PAYMENT TO SESSION MAP [1]
         activeSessions.set(sessionId, {
             amount: intentData.amount,
             currency: intentData.currency || 'USD',
@@ -176,7 +175,6 @@ router.post('/joinGroup', async (req, res) => {
     }
 });
 
-// 5. POST /bot/authorizePayment (REAL LEDGER TRANSACTION FLOW) [1]
 router.post('/authorizePayment', async (req, res) => {
     const { telegramUserId, sessionId, password } = req.body;
 
@@ -305,6 +303,77 @@ router.post('/authorizePayment', async (req, res) => {
     } catch (error: any) {
         console.error('authorizePayment failed:', error);
         return res.status(500).json({ error: error.message || 'Payment initiation failed.' });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. POST /bot/buildPayment
+// The manual path wizard. No AI required — recipient and amount are structured. [1]
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/buildPayment', async (req, res) => {
+    const { telegramUserId, recipient, amount, paymentType } = req.body;
+
+    try {
+        let recipientWallet = '';
+        let recipientName = 'External Wallet';
+
+        // Uncomment getClient at the top of your imports if you commented it out! [1]
+        const client = await getClient();
+
+        // 1. Resolve recipient based on the manual builder selection [1]
+        if (recipient.type === 'phone') {
+            const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipient.value.trim())).get();
+            if (!matchedUser || !matchedUser.walletAddress) {
+                return res.json({ status: 'error', reason: `No registered user found with phone number "${recipient.value}".` });
+            }
+            recipientWallet = matchedUser.walletAddress;
+            recipientName = matchedUser.displayName || 'Registered User';
+        }
+        else if (recipient.type === 'username') {
+            const cleanUsername = recipient.value.trim().startsWith('@') ? recipient.value.trim() : `@${recipient.value.trim()}`;
+            const matchedUser = await db.select().from(users).where(eq(users.telegramUsername, cleanUsername)).get();
+            if (!matchedUser || !matchedUser.walletAddress) {
+                return res.json({ status: 'error', reason: `No registered user found with username "${cleanUsername}".` });
+            }
+            recipientWallet = matchedUser.walletAddress;
+            recipientName = matchedUser.displayName || 'Registered User';
+        }
+        else if (recipient.type === 'wallet') {
+            // Direct out-of-ecosystem payment to a raw wallet pointer [1]
+            recipientWallet = recipient.value.trim();
+            try {
+                const resolvedWallet = await client.walletAddress.get({ url: recipientWallet });
+                recipientName = `External (${resolvedWallet.id.split('/').pop()})`;
+            } catch (e) {
+                return res.json({ status: 'error', reason: `Invalid Open Payments wallet address pointer.` });
+            }
+        }
+
+        const receiverWallet = await client.walletAddress.get({ url: recipientWallet });
+        const currency = receiverWallet.assetCode; // e.g. "USD" or "ZAR"
+
+        const sessionId = crypto.randomUUID();
+
+        activeSessions.set(sessionId, {
+            amount: parseFloat(amount),
+            currency,
+            recipientWallet
+        });
+
+        return res.json({
+            status: 'ok',
+            sessionId,
+            payment: {
+                amountDisplay: parseFloat(amount).toFixed(2),
+                currency,
+                recipientDisplay: recipientName,
+                recipientWallet
+            }
+        });
+
+    } catch (error: any) {
+        console.error('buildPayment failed:', error);
+        return res.json({ status: 'error', reason: error.message || 'Failed to construct manual payment.' });
     }
 });
 
