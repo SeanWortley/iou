@@ -222,9 +222,12 @@ router.post('/processPlainText', async (req, res) => {
                     }
 
                     if (!matchedUser) {
-                        matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
-                        if (!matchedUser) {
-                            matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipientQuery)).get();
+                        if (recipientQuery.startsWith('@')) {
+                            matchedUser = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
+                        } else {
+                            const normalizedPhone = normalizePhoneNumber(recipientQuery);
+                            matchedUser = await db.select().from(users).where(eq(users.phoneNumber, normalizedPhone)).get();
+
                             if (!matchedUser) {
                                 matchedUser = await db.select().from(users).where(eq(users.displayName, recipientQuery)).get();
                             }
@@ -279,7 +282,7 @@ router.post('/processPlainText', async (req, res) => {
                         clarifications: [{
                             field: 'recipient',
                             question: (amount && amount > 0)
-                                ? `👤 Who should I send ${amount.toFixed(2)} ${currency} to? Send their @username, phone, or wallet.`
+                                ? `👤 Who should I send ${amount.toFixed(2)} to? Send their @username, phone, or wallet.`
                                 : `👤 Who would you like to pay? Send their @username, phone, or wallet.`,
                             suggestions: groupRoster,
                         }],
@@ -568,7 +571,9 @@ router.post('/buildPayment', async (req, res) => {
         const client = await getClient();
 
         if (recipient.type === 'phone') {
-            const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, recipient.value.trim())).get();
+            const normalizedPhone = normalizePhoneNumber(recipient.value.trim());
+            const matchedUser = await db.select().from(users).where(eq(users.phoneNumber, normalizedPhone)).get();
+
             if (!matchedUser || !matchedUser.walletAddress) {
                 return res.json({ status: 'error', reason: `No registered user found with phone number "${recipient.value}".` });
             }
@@ -687,6 +692,24 @@ function normalizeWalletAddress(url: string): string {
         return 'https://' + trimmed.substring(1);
     }
     return trimmed;
+}
+
+// Helper to automatically convert local SA phone numbers (060...) to international format (2760...) [1]
+function normalizePhoneNumber(phone: string): string {
+    // Remove any spaces, dashes, or brackets
+    let cleaned = phone.replace(/[^0-9+]/g, '').trim();
+
+    // Strip leading "+" if present (e.g. +2760... -> 2760...)
+    if (cleaned.startsWith('+')) {
+        cleaned = cleaned.substring(1);
+    }
+
+    // If it starts with a local "0" and is 10 digits long, replace "0" with "27" [1]
+    if (cleaned.startsWith('0') && cleaned.length === 10) {
+        cleaned = '27' + cleaned.substring(1);
+    }
+
+    return cleaned;
 }
 
 export default router;
