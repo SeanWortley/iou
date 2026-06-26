@@ -66,15 +66,40 @@ router.post('/processRegistration', async (req, res) => {
     }
 });
 
+// Inside backend/src/routes/bot.ts
+
 router.post('/processPlainText', async (req, res) => {
     const { telegramUserId, text, context, telegramMessage } = req.body;
 
     try {
+        const isGroup = context?.chatType === 'group' || context?.chatType === 'supergroup';
+        const groupTelegramId = context?.chatId?.toString();
+
+        // 1. DYNAMICALLY BUILD THE ROSTER FROM SQLITE [1]
+        // If we are in a group chat, grab the display names of all registered users in this group! [1]
+        let groupRoster: string[] = [];
+        if (isGroup && groupTelegramId) {
+            const members = await db.select({ displayName: users.displayName })
+                .from(users)
+                .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
+                .where(eq(groupMembers.groupTelegramId, groupTelegramId))
+                .all(); // .all() gets the list of rows
+
+            // Map DB rows to a string list: ["@Noah_99", "@Sizwe", ...] [1]
+            groupRoster = members.map(m => m.displayName).filter((name): name is string => !!name);
+        }
+
+        // 2. Call their FastAPI endpoint on '/parse' [1]
         const aiServerUrl = process.env.AI_SERVER_URL || 'http://localhost:8000/parse';
+
+        // We send the EXACT keys their UserRequest BaseModel expects! [1]
         const aiResponse = await axios.post(aiServerUrl, {
-            telegram_object: telegramMessage
+            text: text,
+            chat_event: telegramMessage || {},
+            group_roster: groupRoster // Passes the real SQLite group roster dynamically [1]
         });
-        const intentData = aiResponse.data;
+
+        const intentData = aiResponse.data; // This is the structured PaymentIntent JSON! [1]
 
         const sessionId = crypto.randomUUID();
 
@@ -82,15 +107,21 @@ router.post('/processPlainText', async (req, res) => {
             return res.json({ status: 'error', reason: 'Only payment instructions are supported right now.' });
         }
 
-        const recipientQuery = intentData.recipient?.trim();
-        if (!recipientQuery) {
+        // Retrieve the transaction details from the first item of their extracted list [1]
+        const extractedTx = intentData.transactions?.[0];
+        if (!extractedTx || !extractedTx.recipients?.length) {
             return res.json({ status: 'error', reason: 'Could not detect who you want to pay.' });
         }
 
-        let matchedUser = null;
-        const isGroup = context?.chatType === 'group' || context?.chatType === 'supergroup';
-        const groupTelegramId = context?.chatId?.toString();
+        const recipientQuery = extractedTx.recipients[0].trim(); // First recipient [1]
+        const amount = extractedTx.amount;
 
+        if (!amount || amount <= 0) {
+            return res.json({ status: 'error', reason: 'Please specify a valid payment amount.' });
+        }
+
+        // 3. Resolve the recipient globally or within group [1]
+        let matchedUser = null;
         if (isGroup && groupTelegramId) {
             matchedUser = await db.select({
                 id: users.id,
@@ -119,9 +150,10 @@ router.post('/processPlainText', async (req, res) => {
             });
         }
 
+        // Save to our active payment sessions map [1]
         activeSessions.set(sessionId, {
-            amount: intentData.amount,
-            currency: intentData.currency || 'USD',
+            amount,
+            currency: extractedTx.target_currency || 'ZAR',
             recipientWallet: matchedUser.walletAddress
         });
 
@@ -129,17 +161,16 @@ router.post('/processPlainText', async (req, res) => {
             status: 'ok',
             sessionId,
             payment: {
-                amountDisplay: intentData.amount.toString(),
-                currency: intentData.currency || 'USD',
+                amountDisplay: amount.toFixed(2),
+                currency: extractedTx.target_currency || 'ZAR',
                 recipientDisplay: matchedUser.displayName,
-                recipientWallet: matchedUser.walletAddress,
-                note: intentData.note || undefined
+                recipientWallet: matchedUser.walletAddress
             }
         });
 
     } catch (error) {
         console.error('processPlainText failed:', error);
-        return res.json({ status: 'error', reason: 'Internal parsing server error.' });
+        return res.json({ status: 'error', reason: 'Failed to complete transaction lookup.' });
     }
 });
 
@@ -374,6 +405,64 @@ router.post('/buildPayment', async (req, res) => {
     } catch (error: any) {
         console.error('buildPayment failed:', error);
         return res.json({ status: 'error', reason: error.message || 'Failed to construct manual payment.' });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. POST /bot/confirmPayment
+// User confirmed the payment interpretation is correct (no money has moved yet) [1].
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/confirmPayment', async (req, res) => {
+    const { telegramUserId, sessionId } = req.body;
+
+    try {
+        // Verify the payment session exists in our memory cache [1]
+        const session = activeSessions.get(sessionId);
+        if (!session) {
+            return res.status(400).json({ error: 'Payment session expired or not found.' });
+        }
+
+        // Acknowledge the confirmation
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error('confirmPayment failed:', error);
+        return res.status(500).json({ error: 'Failed to confirm payment session.' });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. POST /bot/finalizePayment
+// We check SQLite to see if the callback route successfully completed the transfer [1].
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/finalizePayment', async (req, res) => {
+    const { telegramUserId, transactionId } = req.body;
+
+    try {
+        // Find the transaction in SQLite [1]
+        const tx = await db.select().from(transactions).where(eq(transactions.id, transactionId)).get();
+
+        if (!tx) {
+            return res.json({ status: 'FAILED', detail: 'Transaction not found.' });
+        }
+
+        // Return the status based on whether /api/callback completed the ledger transfer [1]
+        if (tx.status === 'COMPLETED') {
+            return res.json({ status: 'COMPLETED' });
+        }
+
+        if (tx.status === 'FAILED') {
+            return res.json({ status: 'FAILED', detail: tx.errorMessage || 'Ledger transfer failed.' });
+        }
+
+        // If still in AWAITING_GRANT, the redirect callback hasn't finished executing yet [1]
+        return res.json({
+            status: 'FAILED',
+            detail: 'Authorization not detected on the ledger yet. Please ensure you have approved the payment in your wallet.'
+        });
+
+    } catch (error: any) {
+        console.error('finalizePayment failed:', error);
+        return res.json({ status: 'FAILED', detail: error.message || 'Verification failed.' });
     }
 });
 

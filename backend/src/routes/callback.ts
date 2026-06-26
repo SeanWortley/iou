@@ -51,8 +51,8 @@ callbackRouter.get('/', async (req, res) => {
         if (sender) {
             await bot.api.sendMessage(
                 sender.telegramId,
-                `❌ *Payment Cancelled!*\n\nYou declined the authorization request at your wallet.`,
-                { parse_mode: 'Markdown' }
+                `❌ <b>Payment Cancelled!</b>\n\nYou declined the authorization request at your wallet.`,
+                { parse_mode: 'HTML' } // Changed to HTML [1]
             );
         }
 
@@ -94,14 +94,13 @@ callbackRouter.get('/', async (req, res) => {
             })
             .where(eq(transactions.id, transactionId));
 
-        // NOTIFY: Send Telegram message via the bot API on SUCCESS [1]
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
         if (sender) {
             const friendlyAmount = (Number(tx.debitAmount) / Math.pow(10, tx.assetScale)).toFixed(2);
             await bot.api.sendMessage(
                 sender.telegramId,
-                `Payment Successful!*\n\nYou have successfully sent *${friendlyAmount} ${tx.assetCode}*.\n\nThank you for using BotPay!`,
-                { parse_mode: 'Markdown' }
+                `🎉 <b>Payment Successful!</b>\n\nYou have successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\nThank you for using BotPay!`,
+                { parse_mode: 'HTML' }
             );
         }
 
@@ -117,10 +116,16 @@ callbackRouter.get('/', async (req, res) => {
 
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
         if (sender) {
+            // 🛡️ SAFELY CLEAN ERROR MESSAGE: Strips out tags to prevent HTML parsing crashes [1]
+            const cleanErrorMessage = message
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
             await bot.api.sendMessage(
                 sender.telegramId,
-                `Payment Failed!\n\nYour transaction could not be completed.\nReason: _${message}_`,
-                { parse_mode: 'Markdown' }
+                `❌ <b>Payment Failed!</b>\n\nYour transaction could not be completed.\n\nReason: <i>${cleanErrorMessage}</i>`,
+                { parse_mode: 'HTML' } // Changed to HTML to prevent crashes [1]
             );
         }
 
@@ -128,8 +133,6 @@ callbackRouter.get('/', async (req, res) => {
     }
 });
 
-// Minimal HTML page shown in the user's browser after the consent redirect.
-// Tells them to go back to Telegram — no frontend to redirect to.
 function page(message: string, success: boolean): string {
     const colour = success ? '#22c55e' : '#ef4444';
     return `<!DOCTYPE html><html><head><meta charset="utf-8">
