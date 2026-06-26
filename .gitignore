@@ -10,6 +10,7 @@ dist/
 .env
 backend/.env
 frontend/.env
+bot/.env
 
 # Private keys — never commit
 *.key
