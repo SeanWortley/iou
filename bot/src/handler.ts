@@ -185,7 +185,7 @@ async function runPlainText(
       telegramMessage: ctx.message
     });
 
-    if (result.status === "error" && (result.reason.includes("📊") || result.reason.includes("👥") || result.reason.includes("ℹ️"))) {
+    if (result.status === "error" && (result.reason.includes("📊") || result.reason.includes("👥") || result.reason.includes("ℹ️") || result.reason.includes("📝"))) {
       const targetChatId = state.originGroupChatId || ctx.chat?.id;
 
       // FIXED: Explicitly passing parse_mode: 'HTML' to the Telegram API [1]
@@ -214,12 +214,9 @@ async function renderParseResult(state: UserState, send: Send, result: ParseResu
     clearPaymentSession(state);
     state.step = "idle";
 
-    // Check if it is a formatted card (Balance Check or Splitwise card) [1]
-    if (result.reason.includes("📊") || result.reason.includes("ℹ️") || result.reason.includes("👥")) {
-      // FIXED: Passing parse_mode: 'HTML' to the custom send wrapper [1]
+    if (result.reason.includes("📊") || result.reason.includes("ℹ️") || result.reason.includes("👥") || result.reason.includes("📝")) {
       await send(result.reason, { parse_mode: 'HTML' });
     } else {
-      // FIXED: Passing parse_mode: 'HTML' to the fallback error template [1]
       await send(`I couldn't read that: ${result.reason}\n\nTry rephrasing your payment.`, { parse_mode: 'HTML' });
     }
     return;
@@ -471,6 +468,75 @@ export async function handleBotMessage(ctx: any): Promise<void> {
         one_time_keyboard: true,
       },
     });
+    return;
+  }
+
+  if (command === "/balance") {
+    clearPaymentSession(state);
+    state.step = "idle";
+
+    await runPlainText(ctx, state, userId, "check my balance", paymentContext(ctx), replySend(ctx));
+    return;
+  }
+
+  if (command === "/settle") {
+    if (isPrivate) {
+      await ctx.reply("💬 Settle your group debts by typing /settle inside your money group chat!");
+      return;
+    }
+
+    const groupId = String(ctx.chat.id);
+
+    try {
+      // 1. Call your new backend group-settle endpoint [1]
+      const response = await fetch(`${process.env.BOT_BACKEND_URL || "http://127.0.0.1:3001"}/bot/group-settle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ groupTelegramId: groupId }),
+      });
+
+      if (!response.ok) throw new Error("Failed to fetch debts");
+      const { debts } = (await response.json()) as { debts: any[] };
+
+      if (debts.length === 0) {
+        await ctx.reply("🎉 <b>All Settled!</b>\n\nThere are currently no active outstanding debts in this money group.", { parse_mode: 'HTML' });
+        return;
+      }
+
+      // 2. Post public announcement in the group chat [1]
+      await ctx.reply(`⚖️ <b>Settle Up Triggered!</b>\n\nI have calculated the outstanding balances for this group. I've sent secure private payment links to those who owe money! Check your DMs.`, { parse_mode: 'HTML' });
+
+      // 3. Loop and send private checkout DMs directly to each debtor! [1]
+      const botUsername = process.env.BOT_USERNAME || 'open_payments_iou_bot';
+
+      for (const d of debts) {
+        try {
+          // Reuses your highly-streamlined pay_amount_recipient deep link! [1]
+          const startPayload = `pay_${d.amountDecimal}_${d.creditorUsername}`;
+
+          await ctx.api.sendMessage(
+              d.debtorTelegramId,
+              `🔔 <b>Outstanding IOU Settle Alert</b>\n\nYou owe <b>${d.creditorName}</b> exactly <b>${d.amountDecimal.toFixed(2)} ${d.currency}</b> in your money group chat.\n\nTap the button below to securely authorize this payment over the Interledger network:`,
+              {
+                parse_mode: 'HTML',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: `🔐 Pay ${d.amountDecimal.toFixed(2)} ${d.currency} to ${d.creditorName}`, url: `https://t.me/${botUsername}?start=${startPayload}` }]
+                  ]
+                }
+              }
+          );
+        } catch (err) {
+          console.error(`Failed to DM debtor ${d.debtorTelegramId}:`, err);
+          // Fallback: If DM fails (e.g. they blocked the bot), tag them publicly in the group [1]
+          await ctx.reply(`⚠️ Hey @${d.debtorName}, I tried to DM you your settlement link but couldn't message you. Please open a chat with me first!`, { parse_mode: 'HTML' });
+        }
+      }
+
+    } catch (error) {
+      console.error("/settle command failed:", error);
+      await ctx.reply("Failed to initiate group settlement. Please try again.");
+    }
     return;
   }
 
@@ -1013,3 +1079,5 @@ export async function handleInlineQuery(ctx: any): Promise<void> {
     }
   ]);
 }
+
+
