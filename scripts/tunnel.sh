@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 #
-# Starts a Cloudflare quick tunnel to the local backend and prints the public
-# https://….trycloudflare.com URL, plus a ready-to-paste command for dev:all.
+# One command to run the whole stack against a public URL.
 #
-# The tunnel must stay running while you use it — leave this terminal open.
-# Closing it (Ctrl+C) tears the tunnel down.
+# Starts a Cloudflare quick tunnel to the local backend, grabs the public
+# https://….trycloudflare.com URL, and then launches `npm run dev:all` with
+# BACKEND_URL already set to that URL — no copy/paste between terminals.
+#
+# The tunnel stays alive for as long as the dev servers run. Ctrl+C stops both.
 #
 # Usage:
-#   npm run tunnel          # tunnels http://localhost:3001 (the backend)
-#   npm run tunnel 4000     # tunnels a different port
-#
+#   npm run tunnel              # tunnel :3001 (the backend) + start dev:all
+#   npm run tunnel 4000         # tunnel a different port + start dev:all
+#   TUNNEL_ONLY=1 npm run tunnel   # just the tunnel; print the URL and wait
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PORT="${1:-3001}"
 LOG="$(mktemp)"
@@ -51,19 +56,28 @@ if [ -z "$URL" ]; then
   exit 1
 fi
 
-cat <<EOF
+echo >&2
+echo "  ✓ Tunnel ready: $URL" >&2
 
-  ✓ Tunnel ready:
+# TUNNEL_ONLY=1 keeps the old behaviour: just expose the tunnel and wait.
+if [ -n "${TUNNEL_ONLY:-}" ]; then
+  cat >&2 <<EOF
 
-      $URL
-
-  In another terminal, start the servers with this URL:
+  Tunnel-only mode. In another terminal:
 
       BACKEND_URL=$URL npm run dev:all
 
   Leave this terminal open — closing it stops the tunnel.
 
 EOF
+  wait "$CF_PID"
+  exit 0
+fi
 
-# Keep the tunnel alive in the foreground until interrupted.
-wait "$CF_PID"
+echo "  → Starting dev:all with BACKEND_URL=$URL" >&2
+echo >&2
+
+# Run the full stack with the tunnel URL wired in. When dev:all exits (Ctrl+C),
+# the EXIT trap tears the tunnel down.
+cd "$REPO_ROOT"
+BACKEND_URL="$URL" npm run dev:all
