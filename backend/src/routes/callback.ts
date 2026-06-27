@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { eq, or } from 'drizzle-orm';
 import { db } from '../db';
-import { transactions, users } from '../db/schema';
+import { transactions, users, iouBalances } from '../db/schema';
 import { getClient, isFinalizedGrant } from '../lib/openPayments';
 import { Bot } from 'grammy';
 
@@ -90,6 +90,7 @@ callbackRouter.get('/', async (req, res) => {
                 updatedAt:          new Date(),
             })
             .where(eq(transactions.id, transactionId));
+        
 
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
 

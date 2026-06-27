@@ -1,11 +1,12 @@
 import { Router } from 'express';
 import { db } from '../db';
-import { users, groupMembers, transactions } from '../db/schema';
+import {users, groupMembers, transactions, iouBalances} from '../db/schema';
 import { and, eq } from 'drizzle-orm';
 import { getClient } from '../lib/openPayments';
 import { isPendingGrant } from '@interledger/open-payments';
 import axios from 'axios';
 import crypto from 'crypto';
+import { Bot } from 'grammy';
 
 // Create an incoming payment + quote purely to read the converted amounts for the
 // confirmation card (what the sender pays vs. what the recipient receives). This
@@ -177,6 +178,68 @@ router.post('/processPlainText', async (req, res) => {
             groupRoster = members.map(m => m.displayName).filter((name): name is string => !!name);
         }
 
+
+        if (text.toLowerCase().includes('settle')) {
+            const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+            if (!sender) {
+                return res.json({ status: 'error', reason: 'You must register first using /start.' });
+            }
+
+            const parts = text.split(/\s+/);
+            const recipientQuery = parts.find(p => p.startsWith('@') || p.match(/^[a-zA-Z]+$/) && !p.toLowerCase().includes('settle') && !p.toLowerCase().includes('up') && !p.toLowerCase().includes('with'));
+
+            if (!recipientQuery) {
+                return res.json({ status: 'error', reason: 'Please specify who you want to settle with, e.g. <i>"settle with @seanwortley"</i>.' });
+            }
+
+            let matchedUser = null;
+            const cleanQuery = recipientQuery.trim();
+            if (cleanQuery.startsWith('@')) {
+                matchedUser = await db.select().from(users).where(eq(users.telegramUsername, cleanQuery)).get();
+            } else {
+                matchedUser = await db.select().from(users).where(eq(users.displayName, cleanQuery)).get();
+            }
+
+            if (!matchedUser || !matchedUser.walletAddress) {
+                return res.json({ status: 'error', reason: `Could not find a registered user named "${recipientQuery}".` });
+            }
+
+            const balance = await db.select().from(iouBalances).where(and(
+                eq(iouBalances.debtorId, sender.id),
+                eq(iouBalances.creditorId, matchedUser.id)
+            )).get();
+
+            if (!balance || Number(balance.amount) <= 0) {
+                return res.json({ status: 'error', reason: `🎉 <b>All Clear!</b>\n\nYou do not owe any outstanding debts to ${matchedUser.displayName}.` });
+            }
+
+            const debtAmountDecimal = Number(balance.amount) / 100;
+            const sessionId = crypto.randomUUID();
+
+            activeSessions.set(sessionId, {
+                transactions: [{
+                    amount: debtAmountDecimal,
+                    currency: balance.currency,
+                    recipientWallet: matchedUser.walletAddress,
+                    recipientName: `Settle: ${matchedUser.displayName}`,
+                    paymentType: 'FIXED_SEND'
+                }],
+                currentIndex: 0,
+                telegramUserId: telegramUserId.toString()
+            });
+
+            return res.json({
+                status: 'ok',
+                sessionId,
+                payment: {
+                    amountDisplay: debtAmountDecimal.toFixed(2),
+                    currency: balance.currency,
+                    recipientDisplay: `settle: ${matchedUser.displayName}`,
+                    recipientWallet: matchedUser.walletAddress
+                }
+            });
+        }
+
         const aiServerUrl = process.env.AI_SERVER_URL || 'http://127.0.0.1:8000/parse';
         const aiResponse = await axios.post(aiServerUrl, {
             text,
@@ -188,18 +251,26 @@ router.post('/processPlainText', async (req, res) => {
         const sessionId = crypto.randomUUID();
 
         console.log('🤖 [AI Parser Response]:\n', JSON.stringify(intentData, null, 2));
+        const isDirectIOU = text.toLowerCase().includes('i owe') || text.toLowerCase().includes('skuld');
+        if (isDirectIOU && intentData.intent === 'PAYMENT') {
+            intentData.intent = 'GROUP_FUND';
+        }
 
         switch (intentData.intent) {
 
             case 'BALANCE_CHECK': {
                 const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
                 if (!sender) {
-                    return res.json({ status: 'error', reason: 'You must register first.' });
+                    return res.json({
+                        status: 'error',
+                        reason: '❌ <b>Balance Check Failed:</b>\n\nYou need to register your profile first using /start.'
+                    });
                 }
-                const client = await getClient();
-                const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress!) });
-                const currency = senderWallet.assetCode;
 
+                const currency = sender.assetCode || 'ZAR';
+                // const startingBalance = 5000.00; // Simulated starting budget
+
+                // 1. Query SQLite for completed transactions to calculate wallet spend
                 const completedTxs = await db.select()
                     .from(transactions)
                     .where(and(
@@ -214,24 +285,155 @@ router.post('/processPlainText', async (req, res) => {
                     }
                 }
 
-                const startingBalance = 5000.00;
-                const currentBalance = startingBalance - totalSpent;
+                // const currentBalance = startingBalance - totalSpent;
+
+                // 2. Query SQLite iouBalances for outstanding Splitwise debts [1]
+                const myDebts = await db.select({
+                    amount: iouBalances.amount,
+                    currency: iouBalances.currency,
+                    creditorName: users.displayName // Selected as creditorName [1]
+                })
+                    .from(iouBalances)
+                    .innerJoin(users, eq(iouBalances.creditorId, users.id))
+                    .where(eq(iouBalances.debtorId, sender.id)).all();
+
+                let debtLines = '';
+                if (myDebts.length > 0) {
+                    const lines = myDebts.map(d => `• You owe <b>${d.creditorName}</b>: <b>${(Number(d.amount) / 100).toFixed(2)} ${d.currency}</b>`);
+                    debtLines = `\n\n📋 <b>Outstanding IOUs:</b>\n${lines.join('\n')}`;
+                } else {
+                    debtLines = `\n\n📋 <b>Outstanding IOUs:</b>\n🎉 <i>Good news! You currently do not owe anyone.</i>`;
+                }
 
                 return res.json({
-                    status: 'error',
+                    status: 'error', // Displays directly in a chat bubble
                     reason: `ℹ️ <b>Live Balance Check</b>\n\n` +
                         `👤 <b>User:</b> ${sender.displayName}\n` +
                         `🏦 <b>Wallet:</b> <code>${sender.walletAddress}</code>\n` +
-                        `💵 <b>Starting Budget:</b> ${startingBalance.toFixed(2)} ${currency}\n` +
-                        `💸 <b>Total Spent:</b> ${totalSpent.toFixed(2)} ${currency}\n` +
-                        `🎯 <b>Available Balance:</b> <b>${currentBalance.toFixed(2)} ${currency}</b>`
+                        // `💵 <b>Starting Budget:</b> ${startingBalance.toFixed(2)} ${currency}\n` +
+                        // `💸 <b>Total Spent:</b> ${totalSpent.toFixed(2)} ${currency}\n` +
+                        // `🎯 <b>Available Balance:</b> <b>${currentBalance.toFixed(2)} ${currency}</b>` +
+                        debtLines // Append the calculated debts! [1]
                 });
             }
 
+            // Inside case 'GROUP_FUND' (around line 200)
             case 'GROUP_FUND': {
+                const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
+                if (!sender) return res.status(400).json({ error: 'Sender not registered.' });
+
+                const groupTelegramId = context?.chatId?.toString();
+                const extractedTx = intentData.transactions?.[0];
+
+                const splitAmount = extractedTx?.amount || 0;
+
+                if (splitAmount <= 0) {
+                    return res.json({ status: 'error', reason: 'Please specify a valid payment amount.' });
+                }
+
+                const client = await getClient();
+
+                // 1. RESOLVE SENDER WALLET DYNAMICALLY TO GET THEIR CURRENCY [1]
+                const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress) });
+                const senderCurrency = senderWallet.assetCode; // This is guaranteed to be 'ZAR' or 'EUR'! [1]
+
+                // 2. INTERCEPT DEFAULT FLAG: Replace "DEFAULT" with the sender's dynamic wallet currency [1]
+                const isDefault = extractedTx?.target_currency === 'DEFAULT' || !extractedTx?.target_currency;
+                const currency = isDefault ? senderCurrency : extractedTx.target_currency;
+
+                // Set the split scale based on the resolved currency scale
+                const scaleMultiplier = Math.pow(10, senderWallet.assetScale); // Dynamic scale mapping [1]
+                const amountInScale = Math.round(splitAmount * scaleMultiplier).toString();
+
+                // ── PATHWAY A: DIRECT IOU ("I owe Fed R50") ── [1]
+                const isDirectIOU = text.toLowerCase().includes('i owe') || text.toLowerCase().includes('skuld');
+
+                if (isDirectIOU && extractedTx?.recipients?.length === 1) {
+                    const recipientQuery = extractedTx.recipients[0].trim();
+
+                    const creditor = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
+                    if (!creditor) {
+                        return res.json({ status: 'error', reason: `Could not find a registered user named "${recipientQuery}".` });
+                    }
+
+                    // Save the direct debt in SQLite: SENDER (You) owes CREDITOR (Fed) in the resolved currency! [1]
+                    const existing = await db.select().from(iouBalances).where(and(
+                        eq(iouBalances.debtorId, sender.id),
+                        eq(iouBalances.creditorId, creditor.id)
+                    )).get();
+
+                    if (existing) {
+                        const newAmount = (Number(existing.amount) + Number(amountInScale)).toString();
+                        await db.update(iouBalances).set({ amount: newAmount }).where(eq(iouBalances.id, existing.id));
+                    } else {
+                        await db.insert(iouBalances).values({
+                            id: crypto.randomUUID(),
+                            groupId: groupTelegramId || 'private_chat',
+                            debtorId: sender.id,
+                            creditorId: creditor.id,
+                            amount: amountInScale,
+                            currency: currency // Now safely saved as 'ZAR' or 'EUR' instead of 'DEFAULT'! [1]
+                        });
+                    }
+
+                    return res.json({
+                        status: 'error',
+                        reason: `📝 <b>IOU Recorded!</b>\n\n` +
+                            `👤 <b>Debtor:</b> You (${sender.displayName})\n` +
+                            `👤 <b>Creditor:</b> ${creditor.displayName}\n` +
+                            `💵 <b>Amount Owed:</b> <b>${splitAmount.toFixed(2)} ${currency}</b>\n\n` +
+                            `Type /balance to see your updated balances!`
+                    });
+                }
+
+                // ── PATHWAY B: GROUP BILL SPLIT ("split R300 dinner") ── [1]
+                if (!isGroup || !groupTelegramId) {
+                    return res.json({ status: 'error', reason: 'You can only split group bills inside a group chat!' });
+                }
+
+                const members = await db.select({ id: users.id, displayName: users.displayName })
+                    .from(users)
+                    .innerJoin(groupMembers, eq(users.id, groupMembers.userId))
+                    .where(eq(groupMembers.groupTelegramId, groupTelegramId)).all();
+
+                if (members.length <= 1) {
+                    return res.json({ status: 'error', reason: 'Not enough registered members in this group to split.' });
+                }
+
+                const totalMembers = members.length;
+                const totalBill = splitAmount * totalMembers;
+
+                for (const member of members) {
+                    if (member.id !== sender.id) {
+                        const existing = await db.select().from(iouBalances).where(and(
+                            eq(iouBalances.groupId, groupTelegramId),
+                            eq(iouBalances.debtorId, member.id),
+                            eq(iouBalances.creditorId, sender.id)
+                        )).get();
+
+                        if (existing) {
+                            const newAmount = (Number(existing.amount) + Number(amountInScale)).toString();
+                            await db.update(iouBalances).set({ amount: newAmount }).where(eq(iouBalances.id, existing.id));
+                        } else {
+                            await db.insert(iouBalances).values({
+                                id: crypto.randomUUID(),
+                                groupId: groupTelegramId,
+                                debtorId: member.id,
+                                creditorId: sender.id,
+                                amount: amountInScale,
+                                currency: currency // Saved dynamically [1]
+                            });
+                        }
+                    }
+                }
+
                 return res.json({
                     status: 'error',
-                    reason: '👥 <b>Group Funding / Bill Splitting:</b>\n\nGroup bill pooling is currently in view-only mode. To execute, please send individual payments to members one-by-one!'
+                    reason: `📊 <b>IOU Split Successful!</b>\n\n` +
+                        `💸 <b>Total Bill:</b> ${totalBill.toFixed(2)} ${currency}\n` +
+                        `👥 <b>Split between:</b> ${totalMembers} members\n` +
+                        `🎯 <b>Each pays:</b> <b>${splitAmount.toFixed(2)} ${currency}</b> to ${sender.displayName}\n\n` +
+                        `Type /balance to see your updated balances!`
                 });
             }
 
@@ -735,5 +937,50 @@ function normalizePhoneNumber(phone: string): string {
 
     return cleaned;
 }
+
+
+/**
+ * 9. POST /bot/group-settle
+ * Resolves all outstanding debts in a group and maps them to Telegram IDs [1].
+ */
+router.post('/group-settle', async (req, res) => {
+    const { groupTelegramId } = req.body;
+
+    try {
+        if (!groupTelegramId) {
+            return res.status(400).json({ error: 'Missing groupTelegramId.' });
+        }
+
+        // 1. Fetch all active debts in this group [1]
+        const rawDebts = await db.select()
+            .from(iouBalances)
+            .where(eq(iouBalances.groupId, groupTelegramId.toString())).all();
+
+        const formattedDebts = [];
+
+        // 2. Loop and resolve BOTH debtor and creditor Telegram details from users table [1]
+        for (const d of rawDebts) {
+            const debtor = await db.select().from(users).where(eq(users.id, d.debtorId)).get();
+            const creditor = await db.select().from(users).where(eq(users.id, d.creditorId)).get();
+
+            if (debtor && creditor && Number(d.amount) > 0) {
+                formattedDebts.push({
+                    id: d.id,
+                    amountDecimal: Number(d.amount) / 100,
+                    currency: d.currency,
+                    debtorTelegramId: debtor.telegramId,
+                    debtorName: debtor.displayName,
+                    creditorName: creditor.displayName,
+                    creditorUsername: creditor.telegramUsername ? creditor.telegramUsername.substring(1) : creditor.displayName, // strip leading '@' [1]
+                });
+            }
+        }
+
+        return res.json({ success: true, debts: formattedDebts });
+    } catch (error) {
+        console.error('group-settle failed:', error);
+        return res.status(500).json({ error: 'Failed to fetch group debts.' });
+    }
+});
 
 export default router;

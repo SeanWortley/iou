@@ -110,6 +110,12 @@ def parse_text(meta_data: dict, group_roster: List[str]) -> dict:
     2. Default 'source_currency' to a flag 'DEFAULT' if the currency is not explicit - e.g. bucks. This default allows the backend to use the wallet's actual currency type
     3. Determine 'conversion_type' accurately based on whether they fix the send or receive side currency values.
     4. Normalize all currencies to standard 3-letter ISO codes.
+    5. BILL SPLITTING & EXPENSE POOLING (GROUP_FUND): If the user wants to split an expense, a bill, or says they paid for something (e.g., 'split R300 dinner', 'I paid R300 for drinks', 'split the bill R400'):
+       - Set the primary 'intent' to 'GROUP_FUND' (do NOT use PAYMENT_MULTIPLE).
+       - Count the total number of people involved. This is the number of members in [AVAILABLE_GROUP_ROSTER] PLUS the [SENDER_IDENTIFIER] (e.g. if roster has 3 people, total members is 4).
+       - Divide the total amount equally among all members (e.g., R300 split among 4 total members is R75 each).
+       - Create a TransactionDetail for each roster member (excluding the [SENDER_IDENTIFIER] themselves). Each detail should list that roster member in 'recipients' and the split amount in 'amount' (signifying they owe this share to the sender).
+
 
     Additional Guidelines:
     1. If the intent is known, such as PAYMENT etc. but does not know the recipient 
