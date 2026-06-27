@@ -6,13 +6,8 @@ import { getClient } from '../lib/openPayments';
 import { isPendingGrant } from '@interledger/open-payments';
 import axios from 'axios';
 import crypto from 'crypto';
-import { Bot } from 'grammy';
 
-// Create an incoming payment + quote purely to read the converted amounts for the
-// confirmation card (what the sender pays vs. what the recipient receives). This
-// mirrors the quote in authorizePayment, but its result is display-only —
-// authorizePayment still quotes for real at pay time, so this never touches the
-// money path.
+
 async function quoteAmounts(
     client: any,
     senderWallet: any,
@@ -87,6 +82,7 @@ interface PaymentSession {
     transactions: QueuedTransaction[];
     currentIndex: number;
     telegramUserId: string;
+    originGroupChatId?: string;
 }
 
 // EXPORTED activeSessions so callbackRouter can read and update the queue [1]
@@ -186,7 +182,7 @@ router.post('/processPlainText', async (req, res) => {
             }
 
             const parts = text.split(/\s+/);
-            const recipientQuery = parts.find(p => p.startsWith('@') || p.match(/^[a-zA-Z]+$/) && !p.toLowerCase().includes('settle') && !p.toLowerCase().includes('up') && !p.toLowerCase().includes('with'));
+            const recipientQuery = parts.find((p: string) => p.startsWith('@') || p.match(/^[a-zA-Z]+$/) && !p.toLowerCase().includes('settle') && !p.toLowerCase().includes('up') && !p.toLowerCase().includes('with'));
 
             if (!recipientQuery) {
                 return res.json({ status: 'error', reason: 'Please specify who you want to settle with, e.g. <i>"settle with @seanwortley"</i>.' });
@@ -268,9 +264,7 @@ router.post('/processPlainText', async (req, res) => {
                 }
 
                 const currency = sender.assetCode || 'ZAR';
-                // const startingBalance = 5000.00; // Simulated starting budget
 
-                // 1. Query SQLite for completed transactions to calculate wallet spend
                 const completedTxs = await db.select()
                     .from(transactions)
                     .where(and(
@@ -535,7 +529,8 @@ router.post('/processPlainText', async (req, res) => {
                 activeSessions.set(sessionId, {
                     transactions: sessionQueue,
                     currentIndex: 0,
-                    telegramUserId: telegramUserId.toString()
+                    telegramUserId: telegramUserId.toString(),
+                    originGroupChatId: groupTelegramId
                 });
 
                 const firstTx = sessionQueue[0];
@@ -912,7 +907,8 @@ router.post('/finalizePayment', async (req, res) => {
     }
 });
 
-function normalizeWalletAddress(url: string): string {
+function normalizeWalletAddress(url: string | null): string {
+    if (!url) return '';
     const trimmed = url.trim();
     if (trimmed.startsWith('$')) {
         return 'https://' + trimmed.substring(1);

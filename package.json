@@ -4,13 +4,13 @@
   "private": true,
   "workspaces": [
     "backend",
-    "frontend"
+    "bot"
   ],
   "scripts": {
     "dev": "concurrently -n backend,frontend -c blue,green \"npm run dev --workspace=backend\" \"npm run dev --workspace=frontend\"",
     "dev:all": "concurrently -n db,backend,bot,ai -c magenta,blue,green,yellow \"npm run db:push\" \"npm run dev --workspace=backend\" \"npm run bot\" \"npm run ai\"",
     "ai": "bash scripts/ai.sh",
-    "tunnel": "bash scripts/tunnel.sh",
+    "tunnel": "scripts/tunnel.sh",
     "bot": "tsx bot/src/index.ts",
     "build": "npm run build --workspaces --if-present",
     "db:push": "npm run db:push --workspace=backend"
