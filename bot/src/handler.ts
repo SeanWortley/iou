@@ -130,12 +130,14 @@ const replySend = (ctx: any): Send => (t, o) => ctx.reply(t, o);
 const dmSend = (ctx: any, chatId: number): Send => (t, o) => ctx.api.sendMessage(chatId, t, o);
 
 function formatPayment(p: PaymentObject): string {
-  const lines = [
-    "Please confirm this payment:",
-    "",
-    `💸 Amount:    ${p.amountDisplay} ${p.currency}`,
-    `👤 Recipient: ${p.recipientDisplay}`,
-  ];
+  const lines = ["Please confirm this payment:", ""];
+  if (p.debitDisplay && p.receiveDisplay) {
+    lines.push(`💸 You pay:       ${p.debitDisplay} ${p.debitCurrency}`);
+    lines.push(`📥 They receive:  ${p.receiveDisplay} ${p.receiveCurrency}`);
+  } else {
+    lines.push(`💸 Amount:    ${p.amountDisplay} ${p.currency}`);
+  }
+  lines.push(`👤 Recipient: ${p.recipientDisplay}`);
   if (p.recipientWallet) lines.push(`🔗 Wallet:    ${p.recipientWallet}`);
   if (p.note) lines.push(`📝 Note:      ${p.note}`);
   return lines.join("\n");

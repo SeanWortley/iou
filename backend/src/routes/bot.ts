@@ -7,6 +7,71 @@ import { isPendingGrant } from '@interledger/open-payments';
 import axios from 'axios';
 import crypto from 'crypto';
 
+// Create an incoming payment + quote purely to read the converted amounts for the
+// confirmation card (what the sender pays vs. what the recipient receives). This
+// mirrors the quote in authorizePayment, but its result is display-only —
+// authorizePayment still quotes for real at pay time, so this never touches the
+// money path.
+async function quoteAmounts(
+    client: any,
+    senderWallet: any,
+    receiverWallet: any,
+    amount: number,
+    paymentType: 'FIXED_SEND' | 'FIXED_RECEIVE',
+) {
+    const incomingGrant = await client.grant.request(
+        { url: receiverWallet.authServer },
+        { access_token: { access: [{ type: 'incoming-payment', actions: ['create', 'read'] }] } },
+    );
+    if (isPendingGrant(incomingGrant) || !incomingGrant.access_token) {
+        throw new Error('Expected non-interactive incoming payment grant');
+    }
+
+    let incomingPayment;
+    if (paymentType === 'FIXED_RECEIVE') {
+        const value = Math.round(amount * Math.pow(10, receiverWallet.assetScale)).toString();
+        incomingPayment = await client.incomingPayment.create(
+            { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+            { walletAddress: receiverWallet.id, incomingAmount: { value, assetCode: receiverWallet.assetCode, assetScale: receiverWallet.assetScale } },
+        );
+    } else {
+        incomingPayment = await client.incomingPayment.create(
+            { url: receiverWallet.resourceServer, accessToken: incomingGrant.access_token.value },
+            { walletAddress: receiverWallet.id },
+        );
+    }
+
+    const quoteGrant = await client.grant.request(
+        { url: senderWallet.authServer },
+        { access_token: { access: [{ type: 'quote', actions: ['create', 'read'] }] } },
+    );
+    if (isPendingGrant(quoteGrant) || !quoteGrant.access_token) {
+        throw new Error('Expected non-interactive quote grant');
+    }
+
+    const quote = paymentType === 'FIXED_RECEIVE'
+        ? await client.quote.create(
+            { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+            { walletAddress: senderWallet.id, receiveAmount: incomingPayment.incomingAmount, receiver: incomingPayment.id, method: 'ilp' },
+        )
+        : await client.quote.create(
+            { url: senderWallet.resourceServer, accessToken: quoteGrant.access_token.value },
+            {
+                walletAddress: senderWallet.id,
+                debitAmount: { value: Math.round(amount * Math.pow(10, senderWallet.assetScale)).toString(), assetCode: senderWallet.assetCode, assetScale: senderWallet.assetScale },
+                receiver: incomingPayment.id,
+                method: 'ilp',
+            },
+        );
+
+    return { debitAmount: quote.debitAmount, receiveAmount: quote.receiveAmount };
+}
+
+// Format an Open Payments Amount { value, assetScale } as a human string.
+function fmtAmount(a: { value: string; assetScale: number }): string {
+    return (Number(a.value) / Math.pow(10, a.assetScale)).toFixed(2);
+}
+
 const router = Router();
 
 interface QueuedTransaction {
@@ -274,6 +339,17 @@ router.post('/processPlainText', async (req, res) => {
                 const firstTx = sessionQueue[0];
                 const prefix = sessionQueue.length > 1 ? `[1/${sessionQueue.length}] ` : '';
 
+                // Quote the first (shown) payment so the card shows both sides.
+                let debit: any, receive: any;
+                try {
+                    const firstReceiver = await client.walletAddress.get({ url: normalizeWalletAddress(firstTx.recipientWallet) });
+                    const q = await quoteAmounts(client, senderWallet, firstReceiver, firstTx.amount, firstTx.paymentType);
+                    debit = q.debitAmount;
+                    receive = q.receiveAmount;
+                } catch (e) {
+                    console.error('processPlainText display quote failed, falling back to single amount:', e);
+                }
+
                 return res.json({
                     status: 'ok',
                     sessionId,
@@ -281,7 +357,11 @@ router.post('/processPlainText', async (req, res) => {
                         amountDisplay: firstTx.amount.toFixed(2),
                         currency: firstTx.currency,
                         recipientDisplay: `${prefix}${firstTx.recipientName}`,
-                        recipientWallet: firstTx.recipientWallet
+                        recipientWallet: firstTx.recipientWallet,
+                        ...(debit && receive ? {
+                            debitDisplay: fmtAmount(debit), debitCurrency: debit.assetCode,
+                            receiveDisplay: fmtAmount(receive), receiveCurrency: receive.assetCode,
+                        } : {}),
                     }
                 });
             }
@@ -539,6 +619,16 @@ router.post('/buildPayment', async (req, res) => {
 
         const currency = (paymentType === 'FIXED_SEND') ? senderWallet.assetCode : receiverWallet.assetCode;
 
+        // Quote up front so the confirmation card can show both sides.
+        let debit: any, receive: any;
+        try {
+            const q = await quoteAmounts(client, senderWallet, receiverWallet, parseFloat(amount), paymentType);
+            debit = q.debitAmount;
+            receive = q.receiveAmount;
+        } catch (e) {
+            console.error('buildPayment display quote failed, falling back to single amount:', e);
+        }
+
         const sessionId = crypto.randomUUID();
 
         activeSessions.set(sessionId, {
@@ -560,7 +650,11 @@ router.post('/buildPayment', async (req, res) => {
                 amountDisplay: parseFloat(amount).toFixed(2),
                 currency,
                 recipientDisplay: recipientName,
-                recipientWallet
+                recipientWallet,
+                ...(debit && receive ? {
+                    debitDisplay: fmtAmount(debit), debitCurrency: debit.assetCode,
+                    receiveDisplay: fmtAmount(receive), receiveCurrency: receive.assetCode,
+                } : {}),
             }
         });
 
