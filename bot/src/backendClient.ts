@@ -46,6 +46,13 @@ export type PaymentObject = {
   recipientWallet?: string;
   /** Optional free-text note / reference the AI extracted. */
   note?: string;
+
+  // Quoted amounts (present once the backend has quoted): what the SENDER pays in
+  // their own wallet currency vs. what the RECIPIENT receives in theirs.
+  debitDisplay?: string;
+  debitCurrency?: string;
+  receiveDisplay?: string;
+  receiveCurrency?: string;
 };
 
 /** One field the backend was NOT confident about and wants the user to clarify. */

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { eq } from 'drizzle-orm';
+import { eq, or } from 'drizzle-orm';
 import { db } from '../db';
 import { transactions, users } from '../db/schema';
 import { getClient, isFinalizedGrant } from '../lib/openPayments';
@@ -92,6 +92,36 @@ callbackRouter.get('/', async (req, res) => {
             .where(eq(transactions.id, transactionId));
 
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
+
+        // Notify the RECIPIENT (if they're a registered user with an open DM) that
+        // they were paid — amount in THEIR wallet currency + who it came from.
+        // receiveAmount is the destination-side amount, so its assetCode/Scale are
+        // the recipient's wallet currency. Best-effort: a failure here is non-fatal.
+        try {
+            const httpsForm = tx.receiverWalletAddress;
+            const dollarForm = httpsForm.startsWith('https://')
+                ? '$' + httpsForm.slice('https://'.length)
+                : httpsForm;
+            const recipient = await db
+                .select()
+                .from(users)
+                .where(or(eq(users.walletAddress, httpsForm), eq(users.walletAddress, dollarForm)))
+                .get();
+
+            if (recipient) {
+                const recv = outgoingPayment.receiveAmount;
+                const recvAmount = (Number(recv.value) / Math.pow(10, recv.assetScale)).toFixed(2);
+                const fromName = sender?.displayName || 'someone';
+                await bot.api.sendMessage(
+                    recipient.telegramId,
+                    `💰 <b>You received a payment!</b>\n\nYou got <b>${recvAmount} ${recv.assetCode}</b> from ${fromName}.`,
+                    { parse_mode: 'HTML' }
+                );
+            }
+        } catch (notifyErr) {
+            console.error('[callback] recipient notification failed (non-fatal):', notifyErr);
+        }
+
         if (sender) {
             const friendlyAmount = (Number(tx.debitAmount) / Math.pow(10, tx.assetScale)).toFixed(2);
 
