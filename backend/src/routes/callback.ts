@@ -1,18 +1,20 @@
 import { Router } from 'express';
-import { eq, or } from 'drizzle-orm';
+import { and, eq, or } from 'drizzle-orm';
 import { db } from '../db';
 import { transactions, users, iouBalances } from '../db/schema';
 import { getClient, isFinalizedGrant } from '../lib/openPayments';
 import { Bot } from 'grammy';
 
-// 1. IMPORT the session trackers from bot.ts [1]
+// Import the session trackers from bot.ts
 import { activeSessions, txToSessionMap } from './bot';
 
 const bot = new Bot(process.env.BOT_TOKEN || '');
 export const callbackRouter = Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/callback
+//
+// GNAP redirect endpoint — the user's wallet auth server redirects their
+// browser here after they approve or deny the payment consent screen.
 // ─────────────────────────────────────────────────────────────────────────────
 callbackRouter.get('/', async (req, res) => {
     const { interact_ref, transactionId, result } = req.query as Record<string, string>;
@@ -30,6 +32,7 @@ callbackRouter.get('/', async (req, res) => {
         return res.status(400).send(page('Payment not found or already processed.', false));
     }
 
+    // 1. User declined consent at their wallet
     if (!interact_ref || result === 'grant_rejected') {
         await db
             .update(transactions)
@@ -82,6 +85,7 @@ callbackRouter.get('/', async (req, res) => {
             }
         );
 
+        // Update transaction status to COMPLETED
         await db
             .update(transactions)
             .set({
@@ -90,60 +94,37 @@ callbackRouter.get('/', async (req, res) => {
                 updatedAt:          new Date(),
             })
             .where(eq(transactions.id, transactionId));
-        
+
+        // 2. WIPE OUTSTANDING SPLITWISE DEBT (If applicable) [1]
+        const recipientUser = await db.select().from(users).where(eq(users.walletAddress, tx.receiverWalletAddress)).get();
+        if (recipientUser) {
+            await db.delete(iouBalances).where(and(
+                eq(iouBalances.debtorId, tx.userId!),
+                eq(iouBalances.creditorId, recipientUser.id)
+            ));
+        }
 
         const sender = await db.select().from(users).where(eq(users.id, tx.userId!)).get();
 
-        // Notify the RECIPIENT (if they're a registered user with an open DM) that
-        // they were paid — amount in THEIR wallet currency + who it came from.
-        // receiveAmount is the destination-side amount, so its assetCode/Scale are
-        // the recipient's wallet currency. Best-effort: a failure here is non-fatal.
-        try {
-            const httpsForm = tx.receiverWalletAddress;
-            const dollarForm = httpsForm.startsWith('https://')
-                ? '$' + httpsForm.slice('https://'.length)
-                : httpsForm;
-            const recipient = await db
-                .select()
-                .from(users)
-                .where(or(eq(users.walletAddress, httpsForm), eq(users.walletAddress, dollarForm)))
-                .get();
-
-            if (recipient) {
-                const recv = outgoingPayment.receiveAmount;
-                const recvAmount = (Number(recv.value) / Math.pow(10, recv.assetScale)).toFixed(2);
-                const fromName = sender?.displayName || 'someone';
-                await bot.api.sendMessage(
-                    recipient.telegramId,
-                    `💰 <b>You received a payment!</b>\n\nYou got <b>${recvAmount} ${recv.assetCode}</b> from ${fromName}.`,
-                    { parse_mode: 'HTML' }
-                );
-            }
-        } catch (notifyErr) {
-            console.error('[callback] recipient notification failed (non-fatal):', notifyErr);
-        }
-
         if (sender) {
             const friendlyAmount = (Number(tx.debitAmount) / Math.pow(10, tx.assetScale)).toFixed(2);
-
-            // 2. CHECK IF THIS TRANSACTION HAS A QUEUED SESSION [1]
             const sessionId = txToSessionMap.get(tx.id);
             let redirectPageText = 'Payment sent! Return to Telegram.';
 
+            // ── SENDER NOTIFICATION & QUEUE HANDLING ── [1]
             if (sessionId) {
                 const session = activeSessions.get(sessionId);
                 if (session) {
-                    // Increment the index to move to the next queued transaction [1]
                     session.currentIndex++;
 
                     if (session.currentIndex < session.transactions.length) {
                         const nextTx = session.transactions[session.currentIndex];
                         const botUsername = process.env.BOT_USERNAME || 'open_payments_iou_bot';
 
-                        // Notify user and send a deep link button for the next payment in the batch [1]
+                        // Notify sender and send the inline deep-link button for the next payment in the batch [1]
                         await bot.api.sendMessage(
                             sender.telegramId,
-                            `🎉 <b>Payment [${session.currentIndex}/${session.transactions.length}] Successful!</b>\n\nYou successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\n👉 Click below to authorize the next payment in your queue: <b>${nextTx.amount.toFixed(2)} ${nextTx.currency} to ${nextTx.recipientName}</b>:`,
+                            `🎉 <b>Payment [${session.currentIndex}/${session.transactions.length}] Successful!</b>\n\nYou successfully sent <b>${friendlyAmount} ${tx.assetCode}</b> to ${recipientUser ? recipientUser.displayName : 'Recipient'}.\n\n👉 Click below to authorize the next payment in your queue: <b>${nextTx.amount.toFixed(2)} ${nextTx.currency} to ${nextTx.recipientName}</b>:`,
                             {
                                 parse_mode: 'HTML',
                                 reply_markup: {
@@ -156,7 +137,7 @@ callbackRouter.get('/', async (req, res) => {
 
                         redirectPageText = 'First payment complete! Return to Telegram to authorize the next payment.';
                     } else {
-                        // Finished the entire batch! [1]
+                        // All queued payments finished successfully! [1]
                         await bot.api.sendMessage(
                             sender.telegramId,
                             `🎉 <b>All Queue Payments Successful!</b>\n\nAll payments in your transaction batch have been completed successfully. Thank you for using BotPay!`,
@@ -166,12 +147,47 @@ callbackRouter.get('/', async (req, res) => {
                     }
                 }
             } else {
-                // Fallback for single standard payments [1]
+                // Fallback for single standard payments (No queue) [1]
                 await bot.api.sendMessage(
                     sender.telegramId,
-                    `🎉 <b>Payment Successful!</b>\n\nYou have successfully sent <b>${friendlyAmount} ${tx.assetCode}</b>.\n\nThank you for using BotPay!`,
+                    `🎉 <b>Payment Successful!</b>\n\nYou have successfully sent <b>${friendlyAmount} ${tx.assetCode}</b> to ${recipientUser ? recipientUser.displayName : 'Recipient'}.\n\nThank you for using BotPay!`,
                     { parse_mode: 'HTML' }
                 );
+            }
+
+            try {
+                const httpsForm = tx.receiverWalletAddress;
+                const dollarForm = httpsForm.startsWith('https://') ? '$' + httpsForm.slice('https://'.length) : httpsForm;
+                const recipient = await db
+                    .select()
+                    .from(users)
+                    .where(or(eq(users.walletAddress, httpsForm), eq(users.walletAddress, dollarForm)))
+                    .get();
+
+                if (recipient) {
+                    const recv = outgoingPayment.receiveAmount;
+                    const recvAmount = (Number(recv.value) / Math.pow(10, recv.assetScale)).toFixed(2);
+                    const fromName = sender.displayName || 'someone';
+
+                    await bot.api.sendMessage(
+                        recipient.telegramId,
+                        `💰 <b>You received a payment!</b>\n\nYou got <b>${recvAmount} ${recv.assetCode}</b> from ${fromName}.`,
+                        { parse_mode: 'HTML' }
+                    );
+                }
+            } catch (notifyErr) {
+                console.error('[callback] recipient notification failed (non-fatal):', notifyErr);
+            }
+
+            if (sessionId) {
+                const session = activeSessions.get(sessionId);
+                if (session && session.originGroupChatId) {
+                    await bot.api.sendMessage(
+                        session.originGroupChatId,
+                        `💸 <b>${sender.displayName}</b> paid <b>${recipientUser ? recipientUser.displayName : 'Recipient'}</b> exactly <b>${friendlyAmount} ${tx.assetCode}</b> ✅`,
+                        { parse_mode: 'HTML' }
+                    );
+                }
             }
 
             res.send(page(redirectPageText, true));
