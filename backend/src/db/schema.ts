@@ -16,6 +16,15 @@ export const users = sqliteTable('users', {
   createdAt:              integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
+export const iouBalances = sqliteTable('iou_balances', {
+  id:         text('id').primaryKey(),
+  groupId:    text('group_id').notNull(), // Group chat ID context [1]
+  debtorId:   text('debtor_id').references(() => users.id).notNull(), // The person who owes
+  creditorId: text('creditor_id').references(() => users.id).notNull(), // The person who is owed
+  amount:     text('amount').notNull(), // Amount in scale as string (e.g. "10000" for R100)
+  currency:   text('currency').notNull(),
+});
+
 export type User    = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 

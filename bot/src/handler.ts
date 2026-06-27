@@ -184,24 +184,47 @@ async function runPlainText(
       context,
       telegramMessage: ctx.message
     });
+
+    if (result.status === "error" && (result.reason.includes("📊") || result.reason.includes("👥") || result.reason.includes("ℹ️"))) {
+      const targetChatId = state.originGroupChatId || ctx.chat?.id;
+
+      // FIXED: Explicitly passing parse_mode: 'HTML' to the Telegram API [1]
+      await ctx.api.sendMessage(targetChatId, result.reason, { parse_mode: 'HTML' });
+
+      clearPaymentSession(state);
+      state.step = "idle";
+      return; // Exit early so no DM is sent! [1]
+    }
+
+    if (state.originGroupChatId && ctx.chat?.type !== 'private') {
+      await ctx.reply(`📩 ${mention(ctx.from)}, I've sent you a DM to confirm this payment.`);
+    }
+    // Standard payment flows continue to render normally
+    await renderParseResult(state, send, result);
   } catch (error) {
     console.error("processPlainText failed", error);
     await send("I couldn't reach the payment service. Please try again in a moment.");
     return;
   }
-  await renderParseResult(state, send, result);
 }
 
-// Render whatever the backend returned: either ask the next clarifying question,
-// or show the finished payment object for Confirm / Cancel. Everything goes
-// through `send`, so this works whether we're in a DM or bouncing into one.
+
 async function renderParseResult(state: UserState, send: Send, result: ParseResult): Promise<void> {
   if (result.status === "error") {
     clearPaymentSession(state);
     state.step = "idle";
-    await send(`I couldn't read that: ${result.reason}\n\nTry rephrasing your payment.`);
+
+    // Check if it is a formatted card (Balance Check or Splitwise card) [1]
+    if (result.reason.includes("📊") || result.reason.includes("ℹ️") || result.reason.includes("👥")) {
+      // FIXED: Passing parse_mode: 'HTML' to the custom send wrapper [1]
+      await send(result.reason, { parse_mode: 'HTML' });
+    } else {
+      // FIXED: Passing parse_mode: 'HTML' to the fallback error template [1]
+      await send(`I couldn't read that: ${result.reason}\n\nTry rephrasing your payment.`, { parse_mode: 'HTML' });
+    }
     return;
   }
+
 
   state.sessionId = result.sessionId;
 
@@ -495,7 +518,6 @@ export async function handleBotMessage(ctx: any): Promise<void> {
       clearPaymentSession(state);
       state.step = "idle";
       state.originGroupChatId = ctx.chat.id;
-      await ctx.reply(`📩 ${mention(ctx.from)}, I've sent you a DM to confirm this payment.`);
       try {
         await runPlainText(ctx, state, userId, afterCommand, paymentContext(ctx), dmSend(ctx, userId));
       } catch (error) {
