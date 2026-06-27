@@ -227,6 +227,7 @@ await client.outgoingPayment.create({ url: sendingWallet.resourceServer, accessT
 
 | Command           | Description                                               |
 | ----------------- | --------------------------------------------------------- |
+| `npm run tunnel`  | **Start everything:** Cloudflare tunnel + `dev:all`, with `BACKEND_URL` auto-set to the tunnel URL |
 | `npm run dev`     | Start backend (:3001) + frontend (:5173)                  |
 | `npm run dev:all` | Start db push + backend + bot + AI server (:8000)         |
 | `npm run ai`      | Start the FastAPI NL parser (:8000) on its own            |
@@ -234,8 +235,16 @@ await client.outgoingPayment.create({ url: sendingWallet.resourceServer, accessT
 | `npm run build`   | Build both packages                                       |
 | `npm run db:push` | Push schema changes to SQLite (no migration files needed) |
 
-> `dev:all` runs the AI server via `python -m uvicorn`. First time, install its
-> deps: `pip install -r backend/src/Interpreter/requirements.txt`.
+> **Recommended dev flow:** just `npm run tunnel`. It opens a Cloudflare quick
+> tunnel to the backend, captures the public `https://….trycloudflare.com` URL,
+> and starts `dev:all` with `BACKEND_URL` already pointed at it — no copy/paste.
+> Ctrl+C stops the servers and the tunnel together. Want only the tunnel? Run
+> `TUNNEL_ONLY=1 npm run tunnel`.
+
+> The AI server runs from a project-local Python venv at
+> `backend/src/Interpreter/.venv`. `npm run ai` (and `dev:all`) create that venv
+> and install `requirements.txt` automatically on first run — no manual
+> `source .venv/bin/activate` or `pip install` needed.
 
 ---
 
