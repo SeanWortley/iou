@@ -63,6 +63,13 @@ class TransactionDetail(BaseModel):
         )
     )
 
+    debtor: str = Field(
+        description="The identifier of the person who owes the money. If the sender says 'I owe Sean', the debtor is the sender. If they say 'Sean owes me', the debtor is Sean."
+    )
+    creditor: str = Field(
+        description="The identifier of the person who is owed the money. If the sender says 'I owe Sean', the creditor is Sean. If they say 'Sean owes me', the creditor is the sender."
+    )
+
 """
 Define the structural layout of Gemini's responses
 Backend can always expect this layout in terms of a JSON
@@ -110,11 +117,28 @@ def parse_text(meta_data: dict, group_roster: List[str]) -> dict:
     2. Default 'source_currency' to a flag 'DEFAULT' if the currency is not explicit - e.g. bucks. This default allows the backend to use the wallet's actual currency type
     3. Determine 'conversion_type' accurately based on whether they fix the send or receive side currency values.
     4. Normalize all currencies to standard 3-letter ISO codes.
-    5. BILL SPLITTING & EXPENSE POOLING (GROUP_FUND): If the user wants to split an expense, a bill, or says they paid for something (e.g., 'split R300 dinner', 'I paid R300 for drinks', 'split the bill R400'):
+    5. EXPENSE SPLITTING & DIRECT DEBT RECORDING (GROUP_FUND): 
+       If the user wants to split an expense, a bill, or records that they owe someone, or someone owes them (e.g., 'split R300 dinner', 'I paid R300 for drinks', 'I owe Sean R50', 'Sean owes me R50', 'Sizwe skuld my R100'):
+       
        - Set the primary 'intent' to 'GROUP_FUND' (do NOT use PAYMENT_MULTIPLE).
-       - Count the total number of people involved. This is the number of members in [AVAILABLE_GROUP_ROSTER] PLUS the [SENDER_IDENTIFIER] (e.g. if roster has 3 people, total members is 4).
-       - Divide the total amount equally among all members (e.g., R300 split among 4 total members is R75 each).
-       - Create a TransactionDetail for each roster member (excluding the [SENDER_IDENTIFIER] themselves). Each detail should list that roster member in 'recipients' and the split amount in 'amount' (signifying they owe this share to the sender).
+       
+       - PATHWAY A: GROUP BILL SPLITTING (e.g., 'split R300 dinner', 'I paid R300'):
+         * Count the total number of people involved. This is the number of members in [AVAILABLE_GROUP_ROSTER] PLUS the [SENDER_IDENTIFIER] (e.g. if roster has 3 people, total members is 4).
+         * Divide the total amount equally among all members (e.g., R300 split among 4 total members is R75 each).
+         * Create a TransactionDetail for each roster member (excluding the [SENDER_IDENTIFIER] themselves). For each, set [1]:
+           - 'debtor': that roster member's identifier (signifying they owe money) [1].
+           - 'creditor': the [SENDER_IDENTIFIER] (signifying they are owed) [1].
+           - 'amount': the split share (e.g., 75.00) [1].
+           - 'recipients': include that roster member's identifier in the list [1].
+       
+       - PATHWAY B: DIRECT DEBTS & IOUs (e.g., 'I owe Sean R50', 'Sean owes me R50'):
+         * Create a single TransactionDetail in the list [1].
+         * Dynamically determine who is the 'debtor' (who owes) and who is the 'creditor' (who is owed) [1]:
+           - If "I owe Sean R50": 'debtor' is the [SENDER_IDENTIFIER], 'creditor' is Sean [1].
+           - If "Sean owes me R50": 'debtor' is Sean, 'creditor' is the [SENDER_IDENTIFIER] [1].
+           - If "Sizwe skuld Danny R100": 'debtor' is Sizwe, 'creditor' is Danny [1].
+         * Set the parsed amount in 'amount' [1].
+         * Add the person getting paid (the creditor) to the 'recipients' list [1].
 
 
     Additional Guidelines:

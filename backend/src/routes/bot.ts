@@ -318,12 +318,14 @@ router.post('/processPlainText', async (req, res) => {
             }
 
             // Inside case 'GROUP_FUND' (around line 200)
+            // Inside backend/src/routes/bot.ts (under case 'GROUP_FUND')
             case 'GROUP_FUND': {
                 const sender = await db.select().from(users).where(eq(users.telegramId, telegramUserId.toString())).get();
                 if (!sender) return res.status(400).json({ error: 'Sender not registered.' });
 
                 const groupTelegramId = context?.chatId?.toString();
-                const extractedTx = intentData.transactions?.[0];
+                // FIX: Finds the first transaction in the list that actually has a valid, non-null amount [1]
+                const extractedTx = intentData.transactions?.find((t: any) => t.amount !== null && t.amount > 0);
 
                 const splitAmount = extractedTx?.amount || 0;
 
@@ -333,33 +335,44 @@ router.post('/processPlainText', async (req, res) => {
 
                 const client = await getClient();
 
-                // 1. RESOLVE SENDER WALLET DYNAMICALLY TO GET THEIR CURRENCY [1]
+                // 1. Resolve currencies dynamically from the network [1]
                 const senderWallet = await client.walletAddress.get({ url: normalizeWalletAddress(sender.walletAddress) });
-                const senderCurrency = senderWallet.assetCode; // This is guaranteed to be 'ZAR' or 'EUR'! [1]
+                const senderCurrency = senderWallet.assetCode;
 
-                // 2. INTERCEPT DEFAULT FLAG: Replace "DEFAULT" with the sender's dynamic wallet currency [1]
                 const isDefault = extractedTx?.target_currency === 'DEFAULT' || !extractedTx?.target_currency;
                 const currency = isDefault ? senderCurrency : extractedTx.target_currency;
 
-                // Set the split scale based on the resolved currency scale
-                const scaleMultiplier = Math.pow(10, senderWallet.assetScale); // Dynamic scale mapping [1]
+                const scaleMultiplier = Math.pow(10, senderWallet.assetScale);
                 const amountInScale = Math.round(splitAmount * scaleMultiplier).toString();
 
-                // ── PATHWAY A: DIRECT IOU ("I owe Fed R50") ── [1]
-                const isDirectIOU = text.toLowerCase().includes('i owe') || text.toLowerCase().includes('skuld');
+                // ── PATHWAY A: DYNAMIC NLP IOUs ("Sizwe skuld my R100", "Sean owes Danny R50") ── [1]
+                // If Gemini extracted a specific debtor and creditor [1]
+                if (extractedTx?.debtor && extractedTx?.creditor) {
 
-                if (isDirectIOU && extractedTx?.recipients?.length === 1) {
-                    const recipientQuery = extractedTx.recipients[0].trim();
+                    // Resolve the DB user profiles using the DB teammate's resolveRecipient helper! [1]
+                    const resolvedDebtor = await resolveRecipient(extractedTx.debtor, isGroup, groupTelegramId);
+                    const resolvedCreditor = await resolveRecipient(extractedTx.creditor, isGroup, groupTelegramId);
 
-                    const creditor = await db.select().from(users).where(eq(users.telegramUsername, recipientQuery)).get();
-                    if (!creditor) {
-                        return res.json({ status: 'error', reason: `Could not find a registered user named "${recipientQuery}".` });
+                    // Map identities (if the resolved entity is the sender themselves, use the sender profile) [1]
+                    const debtorId = (extractedTx.debtor === sender.telegramUsername || extractedTx.debtor === `@${sender.telegramId}`)
+                        ? sender.id
+                        : resolvedDebtor?.id;
+
+                    const creditorId = (extractedTx.creditor === sender.telegramUsername || extractedTx.creditor === `@${sender.telegramId}`)
+                        ? sender.id
+                        : resolvedCreditor?.id;
+
+                    if (!debtorId || !creditorId) {
+                        return res.json({
+                            status: 'error',
+                            reason: `Could not resolve the debtor (${extractedTx.debtor}) or creditor (${extractedTx.creditor}) in our system.`
+                        });
                     }
 
-                    // Save the direct debt in SQLite: SENDER (You) owes CREDITOR (Fed) in the resolved currency! [1]
+                    // Save the direct IOU relationship in SQLite: debtor owes creditor! [1]
                     const existing = await db.select().from(iouBalances).where(and(
-                        eq(iouBalances.debtorId, sender.id),
-                        eq(iouBalances.creditorId, creditor.id)
+                        eq(iouBalances.debtorId, debtorId),
+                        eq(iouBalances.creditorId, creditorId)
                     )).get();
 
                     if (existing) {
@@ -369,18 +382,22 @@ router.post('/processPlainText', async (req, res) => {
                         await db.insert(iouBalances).values({
                             id: crypto.randomUUID(),
                             groupId: groupTelegramId || 'private_chat',
-                            debtorId: sender.id,
-                            creditorId: creditor.id,
+                            debtorId, // Saved dynamically [1]
+                            creditorId, // Saved dynamically [1]
                             amount: amountInScale,
-                            currency: currency // Now safely saved as 'ZAR' or 'EUR' instead of 'DEFAULT'! [1]
+                            currency
                         });
                     }
+
+                    // Resolve friendly names for display
+                    const debtorName = debtorId === sender.id ? 'You' : (resolvedDebtor?.displayName || extractedTx.debtor);
+                    const creditorName = creditorId === sender.id ? 'You' : (resolvedCreditor?.displayName || extractedTx.creditor);
 
                     return res.json({
                         status: 'error',
                         reason: `📝 <b>IOU Recorded!</b>\n\n` +
-                            `👤 <b>Debtor:</b> You (${sender.displayName})\n` +
-                            `👤 <b>Creditor:</b> ${creditor.displayName}\n` +
+                            `👤 <b>Debtor:</b> ${debtorName}\n` +
+                            `👤 <b>Creditor:</b> ${creditorName}\n` +
                             `💵 <b>Amount Owed:</b> <b>${splitAmount.toFixed(2)} ${currency}</b>\n\n` +
                             `Type /balance to see your updated balances!`
                     });
@@ -421,7 +438,7 @@ router.post('/processPlainText', async (req, res) => {
                                 debtorId: member.id,
                                 creditorId: sender.id,
                                 amount: amountInScale,
-                                currency: currency // Saved dynamically [1]
+                                currency: currency
                             });
                         }
                     }
@@ -453,7 +470,8 @@ router.post('/processPlainText', async (req, res) => {
 
             case 'PAYMENT':
             case 'PAYMENT_MULTIPLE': {
-                const extractedTransactions = intentData.transactions || [];
+                const extractedTransactions = (intentData.transactions || [])
+                    .filter((t: any) => t.amount !== null && t.amount > 0);
                 if (extractedTransactions.length === 0) {
                     return res.json({ status: 'error', reason: 'Could not detect any transaction details.' });
                 }
