@@ -1,8 +1,15 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from google import genai
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List, Dict, Any
 from fastapi import FastAPI, HTTPException
+
+# Load backend/.env (two dirs up: backend/src/Interpreter → backend) so
+# GEMINI_API_KEY is available no matter how this server is started — `npm run
+# ai`, `dev:all`, or `python -m uvicorn parser:app` straight from the venv.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 """"""
 # FOR MY TESTING:
